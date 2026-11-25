@@ -182,16 +182,16 @@ def verifier_code_genere(
 
 
 def exporter_excel(dossier_factures: Path, extractions: dict[str, list[tuple[str, int]]], sortie_xlsx: Path) -> int:
-    """Écrit l'inventaire Excel consolidé à partir des articles extraits par le code généré."""
+    """Écrit l'inventaire Excel consolidé au format exact attendu par `commun.py`."""
     classeur = Workbook()
     feuille = classeur.active
     feuille.title = "Inventaire"
-    feuille.append(["Facture", "Date", "Article", "Libellé", "Quantité"])
+    feuille.append(["Facture", "Date", "Page", "Article", "Libellé", "Quantité"])
     total = 0
     for chemin_pdf in sorted(dossier_factures.glob("*.pdf")):
         jour = extraire_date_pdf(chemin_pdf)
         for pos, (libelle, qte) in enumerate(extractions.get(chemin_pdf.name, []), 1):
-            feuille.append([chemin_pdf.name, jour, pos, libelle, qte])
+            feuille.append([chemin_pdf.name, jour, 1, pos, libelle, qte])
             feuille.cell(feuille.max_row, 2).number_format = "dd/mm/yyyy"
             total += 1
     feuille.freeze_panes = "A2"
