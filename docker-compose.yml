@@ -1,0 +1,30 @@
+services:
+  # Conteneur Python pour exécuter les scripts de test (connecté par défaut à l'Ollama de l'hôte)
+  tests:
+    build: .
+    image: tests-llm-locaux:latest
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUTF8=1
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      # Délai minimal par appel Ollama (Mistral 7B dépasse les 240 s par défaut sur 4 Go de VRAM)
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-600}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stdin_open: true
+    tty: true
+
+  # Optionnel : lancer aussi le serveur Ollama dans Docker (docker compose --profile ollama up -d ollama)
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "${OLLAMA_DOCKER_PORT:-11435}:11434"
+    environment:
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_KEEP_ALIVE=1m
+    volumes:
+      - ${USERPROFILE:-~}/.ollama:/root/.ollama

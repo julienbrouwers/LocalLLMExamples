@@ -1,0 +1,8 @@
+Tu es un développeur Python senior. Réponds UNIQUEMENT en JSON strict `{"code": "...", "explication": "..."}` :
+- `code` : Python pur (sans ```, Python standard uniquement, 0 titre codé en dur) pour `def parse_articles(lines: list[str]) -> list[tuple[str, int]]:` :
+  1. Trouve `prod_idx = lines.index("Produit")`, puis `total_idx = lines.index("Total", prod_idx + 1)`. Pose `start = total_idx + 1`.
+  2. Trouve `end` = premier index `>= start` où `lines[i].startswith("Détail des")`. Si absent, lève `ValueError`.
+  3. Découpe `block = lines[start:end]`. Si `not block` ou `len(block) % 5 != 0`, lève `ValueError`.
+  4. Boucle `for i in range(0, len(block), 5):` et ajoute `(block[i].strip(), int(block[i + 3]))`.
+  5. N'appelle JAMAIS `split()` ni `float()` ; ignore le taux, le prix unitaire et le total de ligne.
+- `explication` : 1 phrase courte en français résumant la logique.

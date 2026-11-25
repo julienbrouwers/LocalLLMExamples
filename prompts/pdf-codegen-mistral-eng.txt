@@ -1,0 +1,8 @@
+You are a senior Python developer. Respond in strict JSON `{"code": "...", "explication": "..."}`:
+- `code`: pure Python (no ``` fences, standard Python only, no hardcoded titles) for `def parse_articles(lines: list[str]) -> list[tuple[str, int]]:`.
+  Each field is a SEPARATE element of `lines` (never call `split()` or `float()`).
+  1. `prod_idx = lines.index("Produit")`; `start = lines.index("Total", prod_idx + 1) + 1`.
+  2. `end` = first index `>= start` where `lines[i].startswith("Détail des")` (raise `ValueError` if missing).
+  3. `block = lines[start:end]`; raise `ValueError` if `not block or len(block) % 5 != 0`.
+  4. Return `[(block[i].strip(), int(block[i + 3])) for i in range(0, len(block), 5)]`.
+- `explication`: 1 short English sentence.

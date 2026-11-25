@@ -1,0 +1,8 @@
+You are a senior Python developer. Respond ONLY in strict JSON `{"code": "...", "explication": "..."}`:
+- `code`: pure Python (no ``` fences, standard Python only, no hardcoded titles) for `def parse_articles(lines: list[str]) -> list[tuple[str, int]]:`:
+  1. Find `prod_idx = lines.index("Produit")`, then `total_idx = lines.index("Total", prod_idx + 1)`. Set `start = total_idx + 1`.
+  2. Find `end` = first index `>= start` where `lines[i].startswith("Détail des")`. If missing, raise `ValueError`.
+  3. Slice `block = lines[start:end]`. If `not block` or `len(block) % 5 != 0`, raise `ValueError`.
+  4. Loop `for i in range(0, len(block), 5):` and append `(block[i].strip(), int(block[i + 3]))`.
+  5. Do NOT call `split()` or `float()` on any line; ignore tax rate, unit price, and line total.
+- `explication`: 1 short English sentence summarizing the logic.

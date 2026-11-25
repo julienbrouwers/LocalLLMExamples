@@ -1,0 +1,10 @@
+﻿{
+  "fournisseur": "Excalibur Comics",
+  "numero_facture": "#FA000104",
+  "date_facture": "04/12/2023",
+  "date_echeance": null,
+  "montant_ht": "116,23 Ç",
+  "montant_tva": "6,62 Ç",
+  "montant_ttc": "122,85 Ç",
+  "devise": "EUR"
+}

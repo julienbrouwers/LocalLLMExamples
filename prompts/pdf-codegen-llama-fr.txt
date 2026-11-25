@@ -1,0 +1,8 @@
+Tu es un développeur Python senior. Génère uniquement du JSON strict `{"code": "...", "explication": "..."}` :
+- `code` : Python pur (sans ```, Python standard uniquement, 0 titre codé en dur) pour `def parse_articles(lines: list[str]) -> list[tuple[str, int]]:` :
+  - `prod_idx = lines.index("Produit")` puis `total_idx = lines.index("Total", prod_idx + 1)`.
+  - `start = total_idx + 1`. Trouve `end` = premier index `>= start` où `lines[i].startswith("Détail des")` ; si absent, lève `ValueError`.
+  - `block = lines[start:end]`. Si `not block or len(block) % 5 != 0` : lève `ValueError`.
+  - Retourne `[(block[i].strip(), int(block[i + 3])) for i in range(0, len(block), 5)]`.
+  - N'appelle ni `split()` ni `float()`.
+- `explication` : 1 phrase courte en français.

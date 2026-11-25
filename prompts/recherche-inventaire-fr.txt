@@ -1,0 +1,5 @@
+Tu filtres un inventaire de livres par recherche exacte de sous-chaîne insensible à la casse sur le titre.
+Règles :
+- Compare uniquement les caractères en minuscules, sans interpréter le sens.
+- Retiens TOUS les titres contenant la sous-chaîne exacte (y compris au pluriel ou à l'intérieur d'un mot, ex. pour "pluie", retiens "Pluie Tome 2", "Pluies Omnibus" et "Parapluie", ignore "Vent du nord").
+- Renvoie uniquement du JSON strict `{"titres": [...]}` avec les titres d'origine exacts. Si aucun ne correspond, renvoie `{"titres": []}`.
