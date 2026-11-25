@@ -209,6 +209,7 @@ def construire_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contexte", type=int, default=4096, metavar="TOKENS", help="Contexte Ollama (par défaut : 4096)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Température d'échantillonnage (par défaut : 0.0)")
     parser.add_argument("--seed", type=int, default=42, help="Graine aléatoire Ollama (par défaut : 42)")
+    parser.add_argument("--max-tours", type=int, default=1, help="Nombre max de tours d'auto-correction guidée par les tests (par défaut : 1)")
     parser.add_argument("--sortie-excel", type=Path, metavar="FICHIER", help="Exporte l'inventaire Excel si le code généré réussit")
     parser.add_argument("--mesures", action="store_true", help="Affiche les compteurs Ollama sur stderr")
     return parser
@@ -220,6 +221,8 @@ def main() -> None:
 
     if args.prompt is not None and not args.prompt.is_file():
         raise SystemExit(f"Fichier prompt introuvable : {args.prompt}")
+    if args.max_tours < 1:
+        raise SystemExit("--max-tours doit être >= 1.")
 
     est_eng = args.langue == "eng" or (args.prompt is not None and args.prompt.stem.endswith("-eng"))
     systeme, source_prompt = charger_prompt(args.modele, "eng" if est_eng else "fr", args.prompt)
@@ -229,21 +232,28 @@ def main() -> None:
         raise SystemExit(f"Facture témoin introuvable : {chemin_exemple}")
 
     lignes_exemple = extraire_lignes_pdf(chemin_exemple)
-    # Réduire le bruit d'entrée : envoyer uniquement la tranche autour du tableau d'articles en vraie liste Python
     debut_extrait = max(0, lignes_exemple.index("Produit") - 1) if "Produit" in lignes_exemple else 0
     fin_extrait = next((i + 2 for i, l in enumerate(lignes_exemple) if l.startswith("Détail des")), len(lignes_exemple))
     extrait_liste = json.dumps(lignes_exemple[debut_extrait:fin_extrait], ensure_ascii=False, indent=2)
+    sortie_attendue = repr(VERITE_TERRAIN.get(chemin_exemple.name, []))
+
     contenu_user = (
         (
-            f"Sample `lines: list[str]` excerpt extracted by `pymupdf` from `{chemin_exemple.name}`:\n"
-            f"```python\nlines = {extrait_liste}\n```\n"
-            "Write `parse_articles(lines: list[str]) -> list[tuple[str, int]]`."
+            f"Specification by example (extracted from `{chemin_exemple.name}` via `pymupdf`):\n"
+            f"```python\nlines = {extrait_liste}\n\n"
+            f"# Expected return value:\n"
+            f"assert parse_articles(lines) == {sortie_attendue}\n```\n"
+            "Write `parse_articles(lines: list[str]) -> list[tuple[str, int]]` so it passes this example "
+            "AND generalizes to any invoice with 1 or more items (and raises `ValueError` on invalid input)."
         )
         if est_eng
         else (
-            f"Extrait `lines: list[str]` extrait par `pymupdf` depuis `{chemin_exemple.name}` :\n"
-            f"```python\nlines = {extrait_liste}\n```\n"
-            "Écris `parse_articles(lines: list[str]) -> list[tuple[str, int]]`."
+            f"Spécification par l'exemple (extrait de `{chemin_exemple.name}` via `pymupdf`) :\n"
+            f"```python\nlines = {extrait_liste}\n\n"
+            f"# Valeur de retour attendue :\n"
+            f"assert parse_articles(lines) == {sortie_attendue}\n```\n"
+            "Écris `parse_articles(lines: list[str]) -> list[tuple[str, int]]` pour réussir cet exemple "
+            "ET généraliser à toute facture de 1 ou plusieurs articles (en levant `ValueError` si l'entrée est invalide)."
         )
     )
 
@@ -256,59 +266,100 @@ def main() -> None:
             "explication": {"type": "string", "minLength": 5},
         },
     }
-    donnees = {
-        "model": args.modele,
-        "stream": False,
-        "keep_alive": 0,
-        "options": options_par_modele(args.modele, args.contexte, args.temperature, args.seed),
-        "format": schema,
-        "messages": [
-            {"role": "system", "content": systeme},
-            {"role": "user", "content": contenu_user},
-        ],
-    }
 
-    try:
-        reponse = appeler_ollama("chat", donnees, timeout=300)
-    except HTTPError as erreur:
-        decharger_modele(args.modele)
-        raise SystemExit(f"Ollama a renvoyé HTTP {erreur.code}.") from None
-    except (URLError, TimeoutError) as erreur:
-        decharger_modele(args.modele)
-        raise SystemExit(f"Ollama injoignable : {erreur}") from None
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": systeme},
+        {"role": "user", "content": contenu_user},
+    ]
 
-    duree_s = round(reponse.get("total_duration", 0) / 1e9, 2)
-    mesures = extraire_mesures(reponse)
+    totaux = {"tours": 0, "prompt_eval_count": 0, "eval_count": 0, "total_duration": 0, "load_duration": 0}
+    code = ""
+    explication = ""
+    verification: dict[str, Any] = {"statut": "FAIL", "controles": {}}
+    extractions: dict[str, list[tuple[str, int]]] = {}
 
-    try:
-        payload = json.loads(reponse["message"]["content"])
-        code = nettoyer_code_python(payload.get("code", ""))
-        explication = payload.get("explication", "")
-    except ValueError as erreur:
-        code = ""
-        explication = f"JSON invalide : {erreur}"
+    for tour in range(1, args.max_tours + 1):
+        est_dernier = tour == args.max_tours
+        donnees = {
+            "model": args.modele,
+            "stream": False,
+            "keep_alive": 0 if est_dernier else "2m",
+            "options": options_par_modele(args.modele, args.contexte, args.temperature, args.seed),
+            "format": schema,
+            "messages": messages,
+        }
 
-    verification, extractions = verifier_code_genere(code, mesures, args.dossier_factures)
+        try:
+            reponse = appeler_ollama("chat", donnees, timeout=300)
+        except HTTPError as erreur:
+            decharger_modele(args.modele)
+            raise SystemExit(f"Ollama a renvoyé HTTP {erreur.code} au tour {tour}.") from None
+        except (URLError, TimeoutError) as erreur:
+            decharger_modele(args.modele)
+            raise SystemExit(f"Ollama injoignable au tour {tour} : {erreur}") from None
 
-    print(f"\n=== Génération `parse_articles` · {args.modele} ({duree_s}s · {mesures.get('prompt_eval_count')} tok in -> {mesures.get('eval_count')} tok out · {mesures.get('done_reason')}) ===")
-    print(f"Prompt : {source_prompt}")
-    print(f"Explication : {explication}")
-    print("Code Python généré :")
-    print(code)
-    print("\nExtractions sur les 4 factures PDF réelles :")
+        totaux["tours"] = tour
+        for cle in ("prompt_eval_count", "eval_count", "total_duration", "load_duration"):
+            totaux[cle] += reponse.get(cle, 0)
+
+        duree_s = round(reponse.get("total_duration", 0) / 1e9, 2)
+        mesures = extraire_mesures(reponse)
+        contenu_brut = reponse["message"]["content"]
+
+        try:
+            payload = json.loads(contenu_brut)
+            code = nettoyer_code_python(payload.get("code", ""))
+            explication = payload.get("explication", "")
+        except ValueError as erreur:
+            code = ""
+            explication = f"JSON invalide : {erreur}"
+
+        verification, extractions = verifier_code_genere(code, mesures, args.dossier_factures)
+        print(
+            f"\n=== Tour {tour}/{args.max_tours} · {args.modele} "
+            f"({duree_s}s · {mesures.get('prompt_eval_count')} tok in -> {mesures.get('eval_count')} tok out · {mesures.get('done_reason')}) "
+            f"-> {verification['statut']} ==="
+        )
+        print(f"Prompt : {source_prompt.name}")
+        print(f"Explication : {explication}")
+        print("Code Python généré :")
+        print(code)
+        for nom_ctrl, res_ctrl in verification["controles"].items():
+            marque = "OK" if res_ctrl["ok"] else "KO"
+            print(f"  [{marque}] {nom_ctrl} : {res_ctrl['detail']}")
+
+        if verification["statut"] == "PASS":
+            if not est_dernier:
+                decharger_modele(args.modele)
+            break
+
+        if not est_dernier:
+            details_ko = "\n".join(
+                f"- {k}: {v['detail']}" for k, v in verification["controles"].items() if not v["ok"]
+            )
+            messages.append({"role": "assistant", "content": contenu_brut})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Your code failed the automated tests:\n{details_ko}\nFix `parse_articles(lines)` and return strict JSON."
+                        if est_eng
+                        else f"Ton code a échoué aux tests automatiques :\n{details_ko}\nCorrige `parse_articles(lines)` et réponds en JSON strict."
+                    ),
+                }
+            )
+
+    print("\nExtractions finales sur les 4 factures PDF réelles :")
     for nom_pdf, articles in extractions.items():
         print(f"  - {nom_pdf} : {articles}")
-    print(f"\nVérification locale : {verification['statut']}")
-    for nom_ctrl, res_ctrl in verification["controles"].items():
-        marque = "OK" if res_ctrl["ok"] else "KO"
-        print(f"  [{marque}] {nom_ctrl} : {res_ctrl['detail']}")
+    print(f"Verdict final ({totaux['tours']} tour(s), {round(totaux['total_duration'] / 1e9, 2)}s total) : {verification['statut']}")
 
     if args.sortie_excel is not None and verification["statut"] == "PASS":
         nb = exporter_excel(args.dossier_factures, extractions, args.sortie_excel)
-        print(f"\nInventaire Excel généré : {args.sortie_excel} ({nb} articles)")
+        print(f"Inventaire Excel généré : {args.sortie_excel} ({nb} articles)")
 
     if args.mesures:
-        print(json.dumps(mesures), file=sys.stderr)
+        print(json.dumps(totaux), file=sys.stderr)
 
 
 if __name__ == "__main__":
