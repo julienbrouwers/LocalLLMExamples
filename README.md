@@ -54,7 +54,7 @@ python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --ke
 
 Expected out-of-the-box states (Ollama Desktop, default settings, audit run **more than ~2 minutes after Ollama starts**): `binding_loopback=reussi`, `echo_canari_exact=reussi`, `zero_connexion_distante=reussi`, `zero_requete_dns_canari=reussi`, `zero_canari_dans_server_log=reussi`, `variables_durcissement=echec` (`Ollama cloud disabled: false`), `pare_feu_sortant_bloque=echec` (`0/3`), `capture_paquets_pktmon=non_execute` -> global verdict `PARTIAL`.
 
-Run it right after starting Ollama Desktop and `zero_connexion_distante` becomes `non_concluant` (`ollama app -> 34.36.133.15:443`, `ollama -> 34.36.133.15:443`, created before the test) -> verdict `FAIL`. That is real traffic to `ollama.com` (hourly update checker in `ollama app.exe`, model recommendations in `ollama.exe`), not prompt egress.
+Run it right after starting Ollama Desktop and `zero_connexion_distante` becomes `non_concluant` (`ollama app -> 34.36.133.15:443`, `ollama -> 34.36.133.15:443`, created before the test) -> verdict `FAIL`. That is real traffic to `ollama.com` (update checker in `ollama app.exe`, repeated hourly; model recommendations in `ollama.exe`, refreshed every few hours), not prompt egress.
 
 *(Optional witness vs. canary packet capture in a second Administrator PowerShell, zero third-party driver install:)*
 
@@ -76,7 +76,7 @@ Ollama only reads `OLLAMA_*` variables **at server startup**. Quit Ollama Deskto
 ```powershell
 # Option A: quit Ollama Desktop (tray icon -> Quit Ollama), harden this shell, start the server with its log redirected
 . .\securiser-ollama-windows.ps1 -Action EnvSession
-Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log
+Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log -RedirectStandardOutput .\ollama-serve.out   # stdout = per-request [GIN] lines
 python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --journal-serveur .\ollama-serve.log
 
 # Option B: persist to Windows User env (saves exact previous values to %TEMP%\ollama-ep3-env-backup.json), then restart Ollama Desktop
@@ -124,7 +124,7 @@ ollama pull tinyllama; "Pull exit code: $LASTEXITCODE"                     # bac
 
 Pin the exact image digest and bind-mount **only** your local models directory read-only to `/models` (no port published). The two `EP3_*` variables are required by **every** `docker compose` call on this file, including `down`; `docker rm -f ollama-airgap` always works as a fallback.
 
-> The pinned digest ships **Ollama `0.23.2`** (`docker exec ollama-airgap ollama --version`), not the host's `0.40.x`, and runs on CPU through an NTFS-to-WSL2 bind mount. Timings are therefore not a like-for-like comparison with native Windows: measured on the reference laptop, `~30s` first load (mostly reading `1.9 GB` through the mount) and `~1s` warm, vs. `~7s` / `~0.2s` native GPU with the same prompt.
+> The pinned digest ships **Ollama `0.23.2`** (`docker exec ollama-airgap ollama --version`), not the host's `0.40.x`, and runs on CPU through an NTFS-to-WSL2 bind mount. Timings are therefore not a like-for-like comparison with native Windows: measured on the reference laptop, `14s` to `30s` first load depending on the disk cache (mostly reading `1.9 GB` through the mount) and `0.8s` to `1.6s` warm, vs. `6s` to `7s` / `~0.2s` native GPU with the same prompt.
 
 ```powershell
 # 1. Pull the exact tested digest directly and resolve the host models directory
@@ -168,6 +168,8 @@ Get-ChildItem "$env:LOCALAPPDATA\Ollama" | Select-Object Name, Length, LastWrite
 $env:OLLAMA_NOHISTORY = "1"
 ollama run qwen2.5:3b --keepalive 0
 ```
+
+(`~/.ollama/history` is only written by the interactive `>>>` prompt: a file piped into `ollama run` leaves it unchanged, with or without `OLLAMA_NOHISTORY`.)
 
 If you used the Ollama Desktop Chat UI, quit Ollama from the system tray and purge `%LOCALAPPDATA%\Ollama\db.sqlite*` and `server*.log` (on a BitLocker-encrypted SSD).
 

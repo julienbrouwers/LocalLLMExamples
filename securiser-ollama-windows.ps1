@@ -97,7 +97,7 @@ switch ($Action) {
         Get-ChildItem Env:OLLAMA* | Format-Table Name, Value -AutoSize
         Write-Output "RAPPEL : Ollama ne lit ces variables qu'au démarrage du serveur. Quittez Ollama Desktop puis lancez le serveur depuis cette session (ou utilisez -Action EnvUtilisateur puis redémarrez Ollama)."
         Write-Output "Pour que verifier_isolation_ollama.py puisse lire le journal de ce serveur :"
-        Write-Output "  Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log"
+        Write-Output "  Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log -RedirectStandardOutput .\ollama-serve.out"
         Write-Output "  python -X utf8 .\fonctions\verifier_isolation_ollama.py --journal-serveur .\ollama-serve.log"
         Write-Output $NoteMisesAJour
     }
