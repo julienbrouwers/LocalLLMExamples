@@ -1,8 +1,148 @@
-# Local LLM Benchmarks on 16 GB RAM & 4 GB VRAM (Ollama)
+# Local LLM Benchmarks & Privacy Lockdown on 16 GB RAM & 4 GB VRAM (Ollama)
 
-Minimalist, **100% reproducible** benchmark repository accompanying Episode 2 of **“Local LLMs: What I Can Actually Do on My Work Laptop”** (`qwen2.5:3b`, `llama3.2:3b`, `mistral:7b` on an `Intel Core i7-10750H`, `16 GB RAM`, `NVIDIA GTX 1650 Ti 4 GB VRAM`).
+Minimalist, **100% reproducible** repository accompanying **“Local LLMs: What I Can Actually Do on My Work Laptop”** (`qwen2.5:3b`, `llama3.2:3b`, `mistral:7b` on an `Intel Core i7-10750H`, `16 GB RAM`, `NVIDIA GTX 1650 Ti 4 GB VRAM`).
 
-Every prompt is stored as a standalone text file in `prompts/` and passed directly to the Python scripts in `fonctions/` with automatic local `PASS / PARTIAL / FAIL` verification.
+- **Branch `episode-2-llmlocaux`** (tag `v2-episode-2`): Episode 2 benchmarks (legacy PHP audit, PDF parser codegen, CSV vs JSON search, categorization, grounded recommendations).
+- **Branch `episode-3-llmlocaux`** *(this branch)*: adds Episode 3 **Privacy & Offline Lockdown** (automated network/isolation audit, PowerShell hardening & reversible Windows Defender Firewall block, zero-network Docker airgap container).
+
+---
+
+## Episode 3 — Reproducing Privacy & Offline Lockdown Step by Step
+
+### Prerequisites & Baseline Capture (From a Fresh Clone)
+
+```powershell
+git clone -b episode-3-llmlocaux https://github.com/julienbrouwers/LocalLLMExamples.git
+Set-Location .\LocalLLMExamples
+
+# 1. Record exact runtime versions (also check Docker Desktop -> About for its UI version)
+ollama --version
+docker version
+docker compose version
+
+# 2. Preload qwen2.5:3b and record its exact API version & digest
+ollama pull qwen2.5:3b
+$api = 'http://127.0.0.1:11434'
+Invoke-RestMethod "$api/api/version"
+(Invoke-RestMethod "$api/api/tags").models | Where-Object name -eq 'qwen2.5:3b' | Select-Object name, digest
+
+# 3. Inspect listening socket and exact process paths
+Get-NetTCPConnection -State Listen -LocalPort 11434 | Select-Object LocalAddress, LocalPort, OwningProcess
+Get-Process -Name 'ollama','ollama app' -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, Path
+```
+
+### Step 1 — Baseline Audit & Cold vs. Warm Canary Run (No Admin Required)
+
+`fonctions/verifier_isolation_ollama.py` generates a **fresh unique canary marker** per run (`CANARI-CONFIDENTIEL-LOCAL-<uuid>`), reports each check individually with an explicit state (`reussi`, `echec`, `non_execute`, `non_concluant`), and logs versions, model digest, `total_duration`, `load_duration`, `ollama ps` `PROCESSOR`, TCP sampling window, inspected files, and capture limits:
+
+```powershell
+# Cold run (force unload first, then keep_alive=5m to allow a warm follow-up)
+ollama stop qwen2.5:3b
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --keep-alive 5m
+
+# Warm run (within 5 minutes) + full JSON report
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --keep-alive 5m --json
+```
+
+Expected out-of-the-box states: `binding_loopback=reussi`, `echo_canari_exact=reussi`, `zero_connexion_distante=reussi`, `zero_requete_dns_canari=reussi`, `zero_canari_dans_server_log=reussi` (or `non_concluant` if `server.log` is absent), `variables_durcissement=echec`, `pare_feu_sortant_bloque=echec`, `capture_paquets_pktmon=non_execute` -> global verdict `PARTIAL`.
+
+*(Optional witness vs. canary packet capture in a second Administrator PowerShell, zero third-party driver install:)*
+
+```powershell
+# Replay once with $run = 'temoin' (idle witness), then once with $run = 'canari'
+$run = 'canari'
+pktmon comp list
+pktmon start --capture --pkt-size 128 --file-name ".\$run.etl"
+# Wait during 'temoin', or run verifier_isolation_ollama.py in the other terminal during 'canari'
+pktmon stop
+pktmon etl2pcap ".\$run.etl" --out ".\$run.pcapng"
+# Inspect in Wireshark, then clean up: Remove-Item .\temoin.*, .\canari.* -ErrorAction SilentlyContinue
+```
+
+### Step 2 — Tier 1: Local Server Hardening (No Admin Required)
+
+Ollama only reads `OLLAMA_*` variables **at server startup**. Quit Ollama Desktop first, then launch `ollama serve` from a hardened session (or persist User env vars with automatic backup/restore):
+
+```powershell
+# Option A: session-only hardening, then start `ollama serve` in this shell
+. .\securiser-ollama-windows.ps1 -Action EnvSession
+ollama serve
+
+# Option B: persist to Windows User env (saves exact previous values to %TEMP%\ollama-ep3-env-backup.json), then restart Ollama
+.\securiser-ollama-windows.ps1 -Action EnvUtilisateur
+
+# Rollback (restores exact previous User env values or deletes if previously absent, then restart Ollama)
+. .\securiser-ollama-windows.ps1 -Action Reinitialiser
+```
+
+> **Security notes:** Ollama has **no built-in authentication** (never bind `0.0.0.0` or Docker `-p 11434:11434` without an authenticated reverse proxy or VPN) and never include `*` in `OLLAMA_ORIGINS` (flagged as `echec` by `verifier_isolation_ollama.py`).
+
+### Step 3 — Tier 2: Windows Defender Outbound Firewall (Admin, Reversible)
+
+Before creating rules, verify that the registry is reachable (`ollama pull tinyllama` succeeds; otherwise a negative block test is inconclusive). Then block **both** `ollama.exe` and `ollama app.exe`, verify pull failure + local inference success, and roll back cleanly (removes **only** the two rules created by this script):
+
+```powershell
+# 1. Connected witness (must succeed before blocking)
+ollama pull tinyllama
+
+# 2. Block both ollama.exe and ollama app.exe (prints active profiles & ActiveStore rules)
+.\securiser-ollama-windows.ps1 -Action Bloquer
+
+# 3. Verify remote pull fails while local canary inference passes --strict (exit 0)
+ollama pull tinyllama
+"Pull exit code: $LASTEXITCODE"
+. .\securiser-ollama-windows.ps1 -Action EnvSession
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --strict
+
+# 4. Rollback: removes ONLY Ollama-Block-Outbound-LocalOnly and Ollama-Block-Outbound-App-LocalOnly
+.\securiser-ollama-windows.ps1 -Action Debloquer
+```
+
+> **Side effects:** while blocked, `ollama pull`, cloud features, and automatic updates fail. Schedule controlled maintenance windows (`Debloquer` -> update/pull -> `Bloquer`).
+
+### Step 4 — Tier 3: Zero-Network Docker Airgap (Digest-Pinned + Models-Only `:ro`)
+
+Pin the exact image digest and bind-mount **only** your local models directory read-only to `/models` (no port published):
+
+```powershell
+# 1. Pull image once, pin its exact repo digest, and resolve the host models directory
+docker pull ollama/ollama:latest
+$env:EP3_OLLAMA_IMAGE = docker image inspect ollama/ollama:latest --format '{{index .RepoDigests 0}}'
+$env:EP3_MODELS       = (Resolve-Path -LiteralPath "$env:USERPROFILE\.ollama\models").Path
+
+# 2. Validate effective Compose config and start offline (--pull never)
+$compose = @('-p', 'ollama-ep3', '-f', '.\docker-compose.offline.yml', '--profile', 'airgap')
+docker compose @compose config
+docker compose @compose up --pull never -d
+
+# 3. Verify NetworkMode=none, read-only /models mount, lo-only interface, local model visibility, pull failure, and local inference
+$cid = docker compose @compose ps -q ollama-airgap
+docker inspect $cid --format '{{.HostConfig.NetworkMode}} {{json .Mounts}}'
+docker compose @compose exec -T ollama-airgap cat /proc/net/dev
+docker compose @compose exec -T ollama-airgap ollama list
+docker compose @compose exec -T --interactive=false ollama-airgap ollama pull tinyllama
+"Pull exit code: $LASTEXITCODE"
+Measure-Command { docker compose @compose exec -T --interactive=false ollama-airgap ollama run qwen2.5:3b 'Reply with OK only.' | Out-Host } | Select-Object TotalSeconds
+docker compose @compose exec -T ollama-airgap ollama ps
+
+# 4. Rollback / clean up
+docker compose @compose down
+```
+
+**Optional `loopback` profile (separate behavior):** `docker-compose.offline.yml` also includes `--profile loopback`, which publishes `127.0.0.1:11435:11434` (restricting **inbound** LAN access only) while keeping Docker's default bridge **outbound** Internet access. Only `--profile airgap` (`network_mode: none`) cuts outbound traffic at the kernel level.
+
+### Step 5 — Disk & Log Hygiene Audit + Zero-Trace Usage
+
+```powershell
+# Inspect plaintext local artifacts
+Get-ChildItem "$env:LOCALAPPDATA\Ollama" | Select-Object Name, Length, LastWriteTime
+
+# Interactive terminal chat with no CLI history and instant VRAM unload
+$env:OLLAMA_NOHISTORY = "1"
+ollama run qwen2.5:3b --keepalive 0
+```
+
+If you used the Ollama Desktop Chat UI, quit Ollama from the system tray and purge `%LOCALAPPDATA%\Ollama\db.sqlite*` and `server*.log` (on a BitLocker-encrypted SSD).
 
 ---
 
@@ -21,6 +161,7 @@ LocalLLMExamples/
 │       └── inventaire-100-vrais-livres-categorise.csv  # 100 categorized real books
 ├── fonctions/
 │   ├── commun.py                                  # Shared Ollama HTTP client & CSV/Excel helpers
+│   ├── verifier_isolation_ollama.py               # Episode 3: 7-check local isolation & canary data-leak verifier
 │   ├── tester_php_unitaire.py                     # Part 1: Stateless PHP audit + dynamic JSON Schema + verifier
 │   ├── generer_parseur_pdf.py                     # Part 2A: LLM Python parser codegen + live test on 4 PDFs
 │   ├── import_factures_qwen.py                    # Part 2A: Full deterministic PDF -> Excel pipeline
@@ -32,6 +173,8 @@ LocalLLMExamples/
 │   ├── php-{qwen,llama,mistral}-{fr,eng}.txt      # Part 1 generalist PHP audit prompts (FR / EN)
 │   ├── pdf-codegen-{qwen,llama,mistral}-{fr,eng}.txt  # Part 2A PDF parser codegen prompts (FR / EN)
 │   └── recherche-inventaire-{fr,eng}.txt          # Part 2B CSV vs JSON search prompts (FR / EN)
+├── securiser-ollama-windows.ps1                   # Episode 3: PowerShell hardening & reversible firewall block
+├── docker-compose.offline.yml                     # Episode 3: Zero-network Docker airgap & loopback profiles
 ├── rejouer-essais-ollama.ps1                      # PowerShell runner for shared vs isolated chat tests
 ├── requirements.txt                               # Python dependencies
 ├── Dockerfile / docker-compose.yml                # Optional containerized execution

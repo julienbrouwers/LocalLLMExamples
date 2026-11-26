@@ -1,0 +1,63 @@
+# Configuration Docker isolée pour l'Épisode 3 (Confidentialité & Hors-Ligne)
+#
+# Prérequis obligatoire avant lancement (épinglage par digest + montage modèles seul en :ro) :
+#   docker pull ollama/ollama:latest
+#   $env:EP3_OLLAMA_IMAGE = docker image inspect ollama/ollama:latest --format '{{index .RepoDigests 0}}'
+#   $env:EP3_MODELS       = (Resolve-Path -LiteralPath "$env:USERPROFILE\.ollama\models").Path
+#
+# 1. Profil `airgap` (RECOMMANDÉ pour l'isolation complète : `network_mode: none`, aucun port publié,
+#    modèles seuls montés sur `/models` en lecture seule, `no-new-privileges:true`) :
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile airgap config
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile airgap up --pull never -d
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile airgap exec -T ollama-airgap cat /proc/net/dev
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile airgap exec -T ollama-airgap ollama list
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile airgap down
+#
+# 2. Profil `loopback` (OPTIONNEL : publie le port uniquement sur `127.0.0.1:11435` côté hôte, jamais `0.0.0.0`) :
+#    ATTENTION : `loopback` restreint uniquement l'accès ENTRANT depuis le LAN/Wi-Fi.
+#    Il utilise le réseau bridge Docker par défaut et CONSERVE un accès réseau SORTANT vers Internet.
+#    Seul le profil `airgap` coupe les flux sortants au niveau noyau.
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile loopback up --pull never -d
+#      docker compose -p ollama-ep3 -f .\docker-compose.offline.yml --profile loopback down
+
+services:
+  ollama-airgap:
+    image: "${EP3_OLLAMA_IMAGE:?Image avec digest requise (ex: ollama/ollama@sha256:...)}"
+    container_name: ollama-airgap
+    profiles: ["airgap"]
+    network_mode: none
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11434"
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_MODELS: "/models"
+    volumes:
+      - type: bind
+        source: "${EP3_MODELS:?Dossier de modèles requis (ex: %USERPROFILE%\\.ollama\\models)}"
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+
+  ollama-loopback:
+    image: "${EP3_OLLAMA_IMAGE:?Image avec digest requise (ex: ollama/ollama@sha256:...)}"
+    container_name: ollama-loopback
+    profiles: ["loopback"]
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "127.0.0.1:11435:11434"
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_MODELS: "/models"
+    volumes:
+      - type: bind
+        source: "${EP3_MODELS:?Dossier de modèles requis (ex: %USERPROFILE%\\.ollama\\models)}"
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false

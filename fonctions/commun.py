@@ -29,7 +29,8 @@ DOSSIER_INVENTAIRES: Path = RACINE / "donnees" / "inventaires"
 CLASSEUR_DEFAUT: Path = DOSSIER_INVENTAIRES / "inventaire-qwen-verification.xlsx"
 CACHE_API_DEFAUT: Path = DOSSIER_ENTREES / "livres-openlibrary.json"
 CSV_CATEGORISE_DEFAUT: Path = DOSSIER_INVENTAIRES / "inventaire-100-vrais-livres-categorise.csv"
-OLLAMA_URL: str = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+_raw_host: str = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip().rstrip("/")
+OLLAMA_URL: str = _raw_host if "://" in _raw_host else f"http://{_raw_host}"
 # Délai minimal (secondes) imposé à chaque appel Ollama ; utile pour Mistral 7B sur 4 Go de VRAM.
 OLLAMA_TIMEOUT_MIN: int = int(os.environ.get("OLLAMA_TIMEOUT", "0") or 0)
 
