@@ -33,7 +33,15 @@ Get-Process -Name 'ollama','ollama app' -ErrorAction SilentlyContinue | Select-O
 
 ### Step 1 — Baseline Audit & Cold vs. Warm Canary Run (No Admin Required)
 
-`fonctions/verifier_isolation_ollama.py` generates a **fresh unique canary marker** per run (`CANARI-CONFIDENTIEL-LOCAL-<uuid>`), reports each check individually with an explicit state (`reussi`, `echec`, `non_execute`, `non_concluant`), and logs versions, model digest, `total_duration`, `load_duration`, `ollama ps` `PROCESSOR`, TCP sampling window, inspected files, and capture limits:
+`fonctions/verifier_isolation_ollama.py` generates a **fresh unique canary marker** per run (`CANARI-CONFIDENTIEL-LOCAL-<uuid>`), reports each check individually with an explicit state (`reussi`, `echec`, `non_execute`, `non_concluant`), and logs versions, model digest, `total_duration`, `load_duration` (labelled `FROID` / `CHAUD`), `ollama ps` `PROCESSOR`, TCP sampling window, inspected files, and capture limits.
+
+What each check actually looks at:
+- **Processes:** `ollama*` (server + Desktop app) **and `llama-server`**, the inference runner of Ollama 0.40.x (`lib\ollama\llama-server.exe`), which loads the weights and processes the prompt.
+- **`zero_connexion_distante`:** every remote TCP connection carries its creation time. Connections opened **during** the test → `echec`. Connections opened **before** it (e.g. the Desktop update checker / model recommendations reaching `ollama.com` right after startup) → `non_concluant`: they cannot be attributed to inference. Re-run once they close (~2 min after Ollama starts) or enable Tier 2.
+- **`zero_canari_dans_server_log`:** scans only the bytes the **active server** wrote to its log **during the test**. If nothing was written, the file is not the active server's log → `non_concluant`.
+- **`variables_durcissement`:** reads the **server's effective configuration** from its log (`server config` line + `Ollama cloud disabled: true|false`), and checks that it was written after the listening process started. Setting variables in the verifier's own shell no longer satisfies it.
+- **Server log location:** Ollama Desktop writes `%LOCALAPPDATA%\Ollama\server.log` (default). `ollama serve` writes to its console: redirect it and pass `--journal-serveur` (see Step 2).
+- **Cold vs. warm:** the default `--keep-alive 0` unloads the model after every run, so every run is cold. Use `--keep-alive 5m` for warm follow-ups.
 
 ```powershell
 # Cold run (force unload first, then keep_alive=5m to allow a warm follow-up)
@@ -44,7 +52,9 @@ python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --ke
 python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --keep-alive 5m --json
 ```
 
-Expected out-of-the-box states: `binding_loopback=reussi`, `echo_canari_exact=reussi`, `zero_connexion_distante=reussi`, `zero_requete_dns_canari=reussi`, `zero_canari_dans_server_log=reussi` (or `non_concluant` if `server.log` is absent), `variables_durcissement=echec`, `pare_feu_sortant_bloque=echec`, `capture_paquets_pktmon=non_execute` -> global verdict `PARTIAL`.
+Expected out-of-the-box states (Ollama Desktop, default settings, audit run **more than ~2 minutes after Ollama starts**): `binding_loopback=reussi`, `echo_canari_exact=reussi`, `zero_connexion_distante=reussi`, `zero_requete_dns_canari=reussi`, `zero_canari_dans_server_log=reussi`, `variables_durcissement=echec` (`Ollama cloud disabled: false`), `pare_feu_sortant_bloque=echec` (`0/3`), `capture_paquets_pktmon=non_execute` -> global verdict `PARTIAL`.
+
+Run it right after starting Ollama Desktop and `zero_connexion_distante` becomes `non_concluant` (`ollama app -> 34.36.133.15:443`, `ollama -> 34.36.133.15:443`, created before the test) -> verdict `FAIL`. That is real traffic to `ollama.com` (hourly update checker in `ollama app.exe`, model recommendations in `ollama.exe`), not prompt egress.
 
 *(Optional witness vs. canary packet capture in a second Administrator PowerShell, zero third-party driver install:)*
 
@@ -64,45 +74,57 @@ pktmon etl2pcap ".\$run.etl" --out ".\$run.pcapng"
 Ollama only reads `OLLAMA_*` variables **at server startup**. Quit Ollama Desktop first, then launch `ollama serve` from a hardened session (or persist User env vars with automatic backup/restore):
 
 ```powershell
-# Option A: session-only hardening, then start `ollama serve` in this shell
+# Option A: quit Ollama Desktop (tray icon -> Quit Ollama), harden this shell, start the server with its log redirected
 . .\securiser-ollama-windows.ps1 -Action EnvSession
-ollama serve
+Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --journal-serveur .\ollama-serve.log
 
-# Option B: persist to Windows User env (saves exact previous values to %TEMP%\ollama-ep3-env-backup.json), then restart Ollama
+# Option B: persist to Windows User env (saves exact previous values to %TEMP%\ollama-ep3-env-backup.json), then restart Ollama Desktop
 .\securiser-ollama-windows.ps1 -Action EnvUtilisateur
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b
 
 # Rollback (restores exact previous User env values from backup; if no backup exists, clears session vars only and preserves pre-existing User vars)
 . .\securiser-ollama-windows.ps1 -Action Reinitialiser
 ```
 
-> **Security notes:** Ollama has **no built-in authentication** (never bind `0.0.0.0` or Docker `-p 11434:11434` without an authenticated reverse proxy or VPN) and never include `*` in `OLLAMA_ORIGINS` (flagged as `echec` by `verifier_isolation_ollama.py`).
+Variables set: `OLLAMA_HOST=http://127.0.0.1:11434`, `OLLAMA_NO_CLOUD=1`, `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_KEEP_ALIVE=5m`. Expected: `variables_durcissement=reussi` (`confirmé côté serveur … cloud disabled: true`) -> verdict `PARTIAL` (firewall still `echec`).
+
+> **What Tier 1 does not do:** it does **not** stop the Ollama Desktop update checker (`ollama app.exe` reaches `ollama.com` at startup, then hourly, and silently installs updates — see `upgrade.log`). No `OLLAMA_*` variable controls it (there is no `OLLAMA_NO_UPDATE_CHECK` in 0.40.x). Turn off automatic updates in the Desktop app settings, use Option A without the Desktop app, or use Tier 2.
+
+> **Security notes:** Ollama has **no built-in authentication** (never bind `0.0.0.0` or Docker `-p 11434:11434` without an authenticated reverse proxy or VPN) and never include `*` in `OLLAMA_ORIGINS` (flagged as `echec` by `verifier_isolation_ollama.py` when the active server accepts it).
 
 ### Step 3 — Tier 2: Windows Defender Outbound Firewall (Admin, Reversible)
 
-Before creating rules, verify that the registry is reachable (`ollama pull tinyllama` succeeds; otherwise a negative block test is inconclusive). Then block **both** `ollama.exe` and `ollama app.exe`, verify pull failure + local inference success, and roll back cleanly (removes **only** the two rules created by this script):
+Before creating rules, verify that the registry is reachable (`ollama pull tinyllama` succeeds; otherwise a negative block test is inconclusive). Then block the **three** Ollama binaries — `ollama.exe`, `ollama app.exe` and the inference runner `lib\ollama\llama-server.exe` — verify pull failure + local inference success, and roll back cleanly (removes **only** the rules created by this script):
 
 ```powershell
-# 1. Connected witness (must succeed before blocking)
-ollama pull tinyllama
+# 0. Record pre-existing rules (should be empty) and the connected witness (must succeed before blocking)
+Get-NetFirewallRule -Name 'Ollama-Block-*' -ErrorAction SilentlyContinue
+ollama pull tinyllama; "Pull exit code: $LASTEXITCODE"
 
-# 2. Block both ollama.exe and ollama app.exe (prints active profiles & ActiveStore rules)
+# 1. Block ollama.exe, ollama app.exe and llama-server.exe (prints blocked paths, active profiles & ActiveStore rules)
 .\securiser-ollama-windows.ps1 -Action Bloquer
 
-# 3. Verify remote pull fails while local canary inference passes --strict (exit 0)
-ollama pull tinyllama
-"Pull exit code: $LASTEXITCODE"
-. .\securiser-ollama-windows.ps1 -Action EnvSession
-python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --strict
+# 2. Verify remote pull fails while local canary inference passes --strict (exit 0).
+#    The server must have been started with the Tier 1 variables (Step 2): the check reads the SERVER's config.
+ollama pull tinyllama; "Pull exit code: $LASTEXITCODE"
+python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --strict   # add --journal-serveur with 'ollama serve'
 
-# 4. Rollback: removes ONLY Ollama-Block-Outbound-LocalOnly and Ollama-Block-Outbound-App-LocalOnly
+# 3. Rollback: removes ONLY Ollama-Block-Outbound-LocalOnly, Ollama-Block-Outbound-App-LocalOnly, Ollama-Block-Outbound-LlamaServer
 .\securiser-ollama-windows.ps1 -Action Debloquer
+Get-NetFirewallRule -Name 'Ollama-Block-*' -ErrorAction SilentlyContinue   # back to empty
+ollama pull tinyllama; "Pull exit code: $LASTEXITCODE"                     # back to 0
 ```
+
+`pare_feu_sortant_bloque` requires all expected rules in the `ActiveStore` (`3/3` when `llama-server.exe` is installed, `2/2` otherwise).
 
 > **Side effects:** while blocked, `ollama pull`, cloud features, and automatic updates fail. Schedule controlled maintenance windows (`Debloquer` -> update/pull -> `Bloquer`).
 
 ### Step 4 — Tier 3: Zero-Network Docker Airgap (Digest-Pinned + Models-Only `:ro`)
 
-Pin the exact image digest and bind-mount **only** your local models directory read-only to `/models` (no port published):
+Pin the exact image digest and bind-mount **only** your local models directory read-only to `/models` (no port published). The two `EP3_*` variables are required by **every** `docker compose` call on this file, including `down`; `docker rm -f ollama-airgap` always works as a fallback.
+
+> The pinned digest ships **Ollama `0.23.2`** (`docker exec ollama-airgap ollama --version`), not the host's `0.40.x`, and runs on CPU through an NTFS-to-WSL2 bind mount. Timings are therefore not a like-for-like comparison with native Windows: measured on the reference laptop, `~30s` first load (mostly reading `1.9 GB` through the mount) and `~1s` warm, vs. `~7s` / `~0.2s` native GPU with the same prompt.
 
 ```powershell
 # 1. Pull the exact tested digest directly and resolve the host models directory
@@ -125,6 +147,8 @@ docker compose @compose exec -T ollama-airgap cat /proc/net/dev
 docker compose @compose exec -T ollama-airgap ollama list
 docker compose @compose exec -T --interactive=false ollama-airgap ollama pull tinyllama
 "Pull exit code: $LASTEXITCODE"
+docker compose @compose exec -T ollama-airgap bash -c 'exec 3<>/dev/tcp/34.36.133.15/443'   # raw IP, no DNS: must fail too
+docker compose @compose exec -T ollama-airgap ollama --version
 Measure-Command { docker compose @compose exec -T --interactive=false ollama-airgap ollama run qwen2.5:3b 'Reply with OK only.' | Out-Host } | Select-Object TotalSeconds
 docker compose @compose exec -T ollama-airgap ollama ps
 

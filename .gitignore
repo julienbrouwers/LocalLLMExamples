@@ -6,3 +6,9 @@ venv/
 Thumbs.db
 ~$*.xlsx
 resultats-ollama/
+
+# Episode 3 : journaux 'ollama serve' et captures PktMon (peuvent contenir du trafic local)
+ollama-serve*.log
+ollama-serve*.out
+*.etl
+*.pcapng

@@ -9,6 +9,13 @@ Produit un résultat explicite par contrôle parmi :
 Enregistre aussi les versions et digests (Ollama `/api/version`, modèle `/api/tags`),
 les temps (`total_duration`, `load_duration`), la colonne `PROCESSOR` de `ollama ps`,
 la fenêtre et le nombre d'échantillons TCP, les fichiers inspectés et les limites de mesure.
+
+Processus surveillés : `ollama*` (serveur + application Desktop) et `llama-server`
+(moteur d'inférence d'Ollama 0.40.x, qui charge les poids et traite les prompts).
+
+Le durcissement est vérifié côté SERVEUR (ligne `server config` / `Ollama cloud disabled`
+du journal du serveur actif), pas dans l'environnement du shell qui lance ce script.
+Avec `ollama serve`, redirigez son journal et passez-le via `--journal-serveur`.
 """
 
 from __future__ import annotations
@@ -18,6 +25,8 @@ import datetime as dt
 import json
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,17 +35,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from commun import OLLAMA_URL, appeler_ollama, decharger_modele, extraire_mesures
 
 
 ADRESSE_LOOPBACK = {"127.0.0.1", "::1", "0.0.0.0", "::", ""}
-REGLES_PARE_FEU_SCRIPT = (
-    "Ollama-Block-Outbound-LocalOnly",
-    "Ollama-Block-Outbound-App-LocalOnly",
-)
+REGLE_CLI = "Ollama-Block-Outbound-LocalOnly"
+REGLE_APP = "Ollama-Block-Outbound-App-LocalOnly"
+REGLE_RUNNER = "Ollama-Block-Outbound-LlamaServer"
 INTERVALLE_POLLING_S = 0.35
+TAILLE_LECTURE_CONFIG = 1_048_576
+SEUIL_CHARGEMENT_FROID_S = 0.5
 
 
 def _executer_powershell(commande: str) -> tuple[bool, str, str]:
@@ -96,16 +107,23 @@ def lire_ollama_ps(modele: str) -> dict[str, Any]:
 
 
 def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
-    """Retourne `(ecoutes, connexions_distantes, erreur)` pour les processus `ollama*`."""
+    """Retourne `(ecoutes, connexions_distantes, erreur)` pour `ollama*` et `llama-server`.
+
+    Chaque connexion porte le nom du processus et son heure de création (`Creation`, ISO 8601),
+    ce qui permet de distinguer une connexion ouverte AVANT le test d'une connexion ouverte PENDANT.
+    """
     if platform.system() != "Windows":
         return [], [], None
 
     ps = (
-        "$p = (Get-Process -Name 'ollama*' -ErrorAction SilentlyContinue).Id; "
-        "if (-not $p) { '[]'; exit 0 } "
-        "$c = @(Get-NetTCPConnection -OwningProcess $p -ErrorAction SilentlyContinue | "
-        "Select-Object OwningProcess, State, LocalAddress, LocalPort, RemoteAddress, RemotePort); "
-        "$c | ConvertTo-Json -Compress"
+        "$procs = @(Get-Process -Name 'ollama*','llama-server' -ErrorAction SilentlyContinue); "
+        "if (-not $procs) { '[]'; exit 0 } "
+        "$noms = @{}; foreach ($x in $procs) { $noms[[int]$x.Id] = $x.ProcessName }; "
+        "$c = @(Get-NetTCPConnection -OwningProcess $procs.Id -ErrorAction SilentlyContinue | "
+        "Select-Object OwningProcess, @{n='Processus';e={$noms[[int]$_.OwningProcess]}}, "
+        "@{n='State';e={[string]$_.State}}, LocalAddress, LocalPort, RemoteAddress, RemotePort, "
+        "@{n='Creation';e={ if ($_.CreationTime) { $_.CreationTime.ToString('yyyy-MM-ddTHH:mm:ss.ffffffzzz') } }}); "
+        "ConvertTo-Json -InputObject $c -Compress"
     )
     ok, sortie, err = _executer_powershell(ps)
     if not ok:
@@ -131,12 +149,59 @@ def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any
     return ecoutes, distantes, None
 
 
+def _horodatage(texte: str | None) -> dt.datetime | None:
+    """Parse un horodatage ISO 8601 (PowerShell ou journal Ollama) ; None si illisible."""
+    if not texte:
+        return None
+    try:
+        return dt.datetime.fromisoformat(texte)
+    except ValueError:
+        return None
+
+
+def classer_connexions(
+    connexions: list[dict[str, Any]], debut_test: dt.datetime
+) -> tuple[list[str], list[str]]:
+    """Déduplique et sépare les connexions distantes en `(anterieures_au_test, pendant_le_test)`.
+
+    Une connexion sans heure de création est classée « pendant » (hypothèse prudente).
+    """
+    vues: set[tuple[Any, ...]] = set()
+    anterieures: list[str] = []
+    pendant: list[str] = []
+    for c in connexions:
+        cle = (c.get("OwningProcess"), c.get("LocalPort"), c.get("RemoteAddress"), c.get("RemotePort"))
+        if cle in vues:
+            continue
+        vues.add(cle)
+        creation = _horodatage(c.get("Creation"))
+        libelle = (
+            f"{c.get('Processus') or c.get('OwningProcess')} -> {c.get('RemoteAddress')}:{c.get('RemotePort')}"
+            f" (créée {creation.strftime('%H:%M:%S') if creation else 'à une heure inconnue'})"
+        )
+        if creation is not None and creation < debut_test:
+            anterieures.append(libelle)
+        else:
+            pendant.append(libelle)
+    return anterieures, pendant
+
+
+def regles_pare_feu_attendues() -> tuple[str, ...]:
+    """Règles exigées : CLI + Desktop, plus le moteur `llama-server.exe` s'il est installé."""
+    regles = [REGLE_CLI, REGLE_APP]
+    exe = shutil.which("ollama")
+    if exe and (Path(exe).resolve().parent / "lib" / "ollama" / "llama-server.exe").exists():
+        regles.append(REGLE_RUNNER)
+    return tuple(regles)
+
+
 def verifier_pare_feu_windows() -> dict[str, Any]:
-    """Exige les DEUX règles sortantes bloquantes effectives dans ActiveStore pour PASS."""
+    """Exige TOUTES les règles sortantes bloquantes attendues, effectives dans ActiveStore, pour PASS."""
     if platform.system() != "Windows":
         return {"etat": "non_execute", "detail": "vérification pare-feu automatique dédiée à Windows"}
 
-    noms_ps = ", ".join(f"'{n}'" for n in REGLES_PARE_FEU_SCRIPT)
+    attendues = regles_pare_feu_attendues()
+    noms_ps = ", ".join(f"'{n}'" for n in attendues)
     ps = (
         f"$r = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name {noms_ps} -ErrorAction SilentlyContinue | "
         "Where-Object { $_.Direction -eq 'Outbound' -and $_.Action -eq 'Block' -and $_.Enabled -eq 'True' } | "
@@ -155,55 +220,137 @@ def verifier_pare_feu_windows() -> dict[str, Any]:
         except ValueError as exc:
             return {"etat": "non_concluant", "detail": f"parsing JSON pare-feu impossible : {exc}"}
 
-    actives = set(regles)
-    manquantes = [r for r in REGLES_PARE_FEU_SCRIPT if r not in actives]
+    actives = set(regles) & set(attendues)
+    manquantes = [r for r in attendues if r not in actives]
+    n = len(attendues)
     if not manquantes:
-        return {"etat": "reussi", "detail": f"2/2 règles effectives actives (ActiveStore) : {', '.join(REGLES_PARE_FEU_SCRIPT)}"}
+        return {"etat": "reussi", "detail": f"{n}/{n} règles effectives actives (ActiveStore) : {', '.join(attendues)}"}
     if actives:
         return {
             "etat": "echec",
-            "detail": f"règles incomplètes ({len(actives)}/2 actives) : manquante(s) = {', '.join(manquantes)}",
+            "detail": f"règles incomplètes ({len(actives)}/{n} actives) : manquante(s) = {', '.join(manquantes)}",
         }
-    return {"etat": "echec", "detail": "0/2 règles sortantes Block actives dans ActiveStore"}
+    return {"etat": "echec", "detail": f"0/{n} règles sortantes Block actives dans ActiveStore"}
 
 
-def verifier_env_durcissement() -> dict[str, Any]:
-    """Vérifie les variables d'environnement de session (`OLLAMA_HOST`, `OLLAMA_NO_CLOUD`, pas de CORS `*`)."""
-    attendues = {
-        "OLLAMA_HOST": os.environ.get("OLLAMA_HOST", ""),
-        "OLLAMA_NO_CLOUD": os.environ.get("OLLAMA_NO_CLOUD", ""),
-    }
-    origins = os.environ.get("OLLAMA_ORIGINS", "")
-    manquantes = [k for k, v in attendues.items() if not v]
+def chemin_journal_serveur(chemin_explicite: str) -> Path | None:
+    """Journal du serveur actif : `--journal-serveur`, sinon `%LOCALAPPDATA%\\Ollama\\server.log` (Desktop)."""
+    if chemin_explicite:
+        return Path(chemin_explicite)
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    return Path(local_app) / "Ollama" / "server.log" if local_app else None
 
-    host_val = attendues["OLLAMA_HOST"].removeprefix("http://").removeprefix("https://").split("/")[0]
-    host_only = host_val.rsplit(":", 1)[0].lower() if ":" in host_val and not host_val.endswith("]") else host_val.lower()
-    host_ok = (not host_only) or host_only in ("127.0.0.1", "localhost", "[::1]", "::1")
-    origins_ok = "*" not in {o.strip() for o in origins.split(",") if o.strip()}
 
-    if not origins_ok:
+def lire_texte_journal(chemin: Path, depuis: int = 0, limite: int | None = None) -> str:
+    """Lit un journal à partir de l'octet `depuis` (ou ses `limite` derniers octets).
+
+    Gère l'UTF-8 (journal Ollama Desktop, `Start-Process -RedirectStandardError`) et l'UTF-16 LE
+    avec BOM (redirection `2>` de Windows PowerShell 5.1).
+    """
+    with chemin.open("rb") as f:
+        entete = f.read(2)
+        utf16 = entete == b"\xff\xfe"
+        taille = chemin.stat().st_size
+        if limite is not None and taille - depuis > limite:
+            depuis = taille - limite
+        if utf16:
+            depuis = max(2, depuis - (depuis % 2))
+        f.seek(depuis)
+        brut = f.read()
+    return brut.decode("utf-16-le" if utf16 else "utf-8", errors="ignore")
+
+
+def demarrage_serveur_actif() -> tuple[dt.datetime | None, str | None]:
+    """Heure de démarrage du processus qui écoute sur le port de `OLLAMA_URL` (Windows)."""
+    if platform.system() != "Windows":
+        return None, "heure de démarrage du serveur lisible uniquement sous Windows"
+    port = urlparse(OLLAMA_URL).port or 11434
+    ps = (
+        f"$l = Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if (-not $l) { exit 0 } "
+        "(Get-Process -Id $l.OwningProcess).StartTime.ToString('yyyy-MM-ddTHH:mm:ss.ffffffzzz')"
+    )
+    ok, sortie, err = _executer_powershell(ps)
+    if not ok:
+        return None, f"lecture du processus serveur impossible : {err}"
+    if not sortie:
+        return None, f"aucun processus n'écoute sur le port {port}"
+    return _horodatage(sortie), None
+
+
+def lire_config_serveur(journal: Path | None) -> dict[str, Any]:
+    """Extrait la configuration EFFECTIVE du serveur actif depuis son journal.
+
+    Retourne `valide=True` seulement si la ligne `Ollama cloud disabled` est postérieure au
+    démarrage du processus qui écoute actuellement (sinon le journal décrit un ancien serveur).
+    """
+    resultat: dict[str, Any] = {"valide": False, "journal": str(journal) if journal else None}
+    if journal is None or not journal.exists():
+        resultat["raison"] = f"journal du serveur introuvable ({journal})"
+        return resultat
+    try:
+        texte = lire_texte_journal(journal, limite=TAILLE_LECTURE_CONFIG)
+    except OSError as exc:
+        resultat["raison"] = f"lecture impossible de {journal.name} : {exc}"
+        return resultat
+
+    cloud = list(re.finditer(r'time=(\S+) .*?msg="Ollama cloud disabled: (true|false)"', texte))
+    if not cloud:
+        resultat["raison"] = f"aucune ligne 'Ollama cloud disabled' dans {journal.name}"
+        return resultat
+    dernier = cloud[-1]
+    heure_config = _horodatage(dernier.group(1))
+    config = list(re.finditer(r'msg="server config" env="map\[(.*?)\]"\s*$', texte, re.MULTILINE))
+    env_brut = config[-1].group(1) if config else ""
+    host = re.search(r"OLLAMA_HOST:(\S+)", env_brut)
+    origins = re.search(r"OLLAMA_ORIGINS:\[([^\]]*)\]", env_brut)
+    resultat.update(
+        {
+            "cloud_desactive": dernier.group(2) == "true",
+            "heure_config": heure_config.isoformat() if heure_config else None,
+            "ollama_host": host.group(1) if host else None,
+            "origines": origins.group(1).split() if origins else [],
+        }
+    )
+
+    demarrage, err = demarrage_serveur_actif()
+    if demarrage is None or heure_config is None:
+        resultat["raison"] = err or "horodatage de configuration illisible"
+        return resultat
+    if heure_config < demarrage - dt.timedelta(seconds=5):
+        resultat["raison"] = (
+            f"la dernière configuration de {journal.name} ({heure_config:%H:%M:%S}) précède le démarrage "
+            f"du serveur actif ({demarrage:%H:%M:%S}) : ce journal n'est pas celui du serveur qui répond"
+        )
+        return resultat
+    resultat["valide"] = True
+    return resultat
+
+
+def verifier_durcissement_serveur(config: dict[str, Any]) -> dict[str, Any]:
+    """Vérifie le durcissement EFFECTIF du serveur actif (et non l'environnement de ce shell)."""
+    if not config.get("valide"):
+        return {
+            "etat": "non_concluant",
+            "detail": f"configuration du serveur actif non vérifiable : {config.get('raison')} "
+            "(avec 'ollama serve', redirigez son journal et passez --journal-serveur)",
+        }
+    host = (config.get("ollama_host") or "").removeprefix("http://").removeprefix("https://").split("/")[0]
+    host_only = host.rsplit(":", 1)[0].strip("[]").lower() if host else ""
+    if config.get("origines") and "*" in config["origines"]:
+        return {"etat": "echec", "detail": "DANGER : le serveur actif accepte OLLAMA_ORIGINS='*' (toute page web peut l'interroger)"}
+    if host_only and host_only not in ("127.0.0.1", "localhost", "::1"):
+        return {"etat": "echec", "detail": f"serveur actif exposé hors loopback : OLLAMA_HOST={config.get('ollama_host')}"}
+    if not config.get("cloud_desactive"):
         return {
             "etat": "echec",
-            "detail": "DANGER : OLLAMA_ORIGINS contient '*' (toute page web peut interroger Ollama local)",
-            "valeurs": attendues,
-        }
-    if manquantes:
-        return {
-            "etat": "echec",
-            "detail": f"non définies dans cette session : {', '.join(manquantes)}",
-            "valeurs": attendues,
-        }
-    if not host_ok:
-        return {
-            "etat": "echec",
-            "detail": f"OLLAMA_HOST exposé hors loopback : {attendues['OLLAMA_HOST']}",
-            "valeurs": attendues,
+            "detail": "serveur actif démarré sans OLLAMA_NO_CLOUD (journal : 'Ollama cloud disabled: false') ; "
+            "définissez les variables puis REDÉMARREZ le serveur",
         }
     return {
         "etat": "reussi",
-        "detail": ", ".join(f"{k}={v}" for k, v in attendues.items())
-        + " (variables lues côté session ; redémarrez ollama serve pour les appliquer au serveur)",
-        "valeurs": attendues,
+        "detail": f"confirmé côté serveur ({Path(config['journal']).name}, config de {config.get('heure_config', '?')[11:19]}) : "
+        f"cloud disabled: true, OLLAMA_HOST={config.get('ollama_host')}",
     }
 
 
@@ -229,31 +376,49 @@ def lire_cache_dns_windows() -> tuple[set[str], str | None]:
         return set(), f"parsing JSON cache DNS impossible : {exc}"
 
 
-def verifier_canari_server_log(jeton: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Vérifie si le jeton canari apparaît en clair dans `%LOCALAPPDATA%\\Ollama\\server.log`."""
-    local_app = os.environ.get("LOCALAPPDATA", "")
-    if not local_app:
-        meta = {"chemin": None, "present": False, "taille_octets": 0}
-        return {"etat": "non_execute", "detail": "LOCALAPPDATA absent (hors Windows)"}, meta
+def taille_journal(chemin: Path | None) -> int | None:
+    """Taille actuelle du journal (None s'il est absent)."""
+    try:
+        return chemin.stat().st_size if chemin is not None and chemin.exists() else None
+    except OSError:
+        return None
 
-    log_path = Path(local_app) / "Ollama" / "server.log"
-    if not log_path.exists():
-        meta = {"chemin": str(log_path), "present": False, "taille_octets": 0}
-        return {"etat": "non_concluant", "detail": f"{log_path} absent à cet emplacement"}, meta
+
+def verifier_canari_journal(
+    jeton: str, journal: Path | None, taille_avant: int | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Cherche le jeton dans les octets écrits dans le journal du serveur PENDANT le test.
+
+    Si rien n'a été écrit pendant le test, le fichier n'est pas le journal du serveur actif
+    (cas typique : `ollama serve` journalise sur la console) et le contrôle est `non_concluant`.
+    """
+    meta: dict[str, Any] = {"chemin": str(journal) if journal else None, "present": False, "octets_ecrits_pendant_test": 0}
+    if journal is None:
+        return {"etat": "non_execute", "detail": "LOCALAPPDATA absent et --journal-serveur non fourni"}, meta
+    if not journal.exists():
+        return {"etat": "non_concluant", "detail": f"{journal} absent à cet emplacement"}, meta
 
     try:
-        taille = log_path.stat().st_size
-        meta = {"chemin": str(log_path), "present": True, "taille_octets": taille}
-        with log_path.open("rb") as f:
-            if taille > 262_144:
-                f.seek(taille - 262_144)
-            extrait = f.read().decode("utf-8", errors="ignore")
+        taille_apres = journal.stat().st_size
+        meta["present"] = True
+        depuis = taille_avant if taille_avant is not None and taille_avant <= taille_apres else 0
+        meta["octets_ecrits_pendant_test"] = taille_apres - depuis
+        if taille_apres == depuis:
+            return {
+                "etat": "non_concluant",
+                "detail": f"aucune ligne écrite dans {journal.name} pendant le test : ce n'est pas le journal du "
+                "serveur actif ('ollama serve' journalise sur la console -> --journal-serveur)",
+            }, meta
+        extrait = lire_texte_journal(journal, depuis=depuis)
         if jeton in extrait:
-            return {"etat": "echec", "detail": f"jeton '{jeton}' détecté en clair dans {log_path.name}"}, meta
-        return {"etat": "reussi", "detail": f"0 occurrence du marqueur dans les 256 derniers Ko de {log_path.name}"}, meta
+            return {"etat": "echec", "detail": f"jeton '{jeton}' détecté en clair dans {journal.name}"}, meta
+        return {
+            "etat": "reussi",
+            "detail": f"0 occurrence du marqueur dans les {meta['octets_ecrits_pendant_test']} octets écrits "
+            f"dans {journal.name} pendant le test",
+        }, meta
     except OSError as exc:
-        meta = {"chemin": str(log_path), "present": True, "taille_octets": 0}
-        return {"etat": "non_concluant", "detail": f"lecture impossible de server.log : {exc}"}, meta
+        return {"etat": "non_concluant", "detail": f"lecture impossible de {journal.name} : {exc}"}, meta
 
 
 def construire_parser() -> argparse.ArgumentParser:
@@ -268,6 +433,12 @@ def construire_parser() -> argparse.ArgumentParser:
         "--keep-alive",
         default="0",
         help="Durée keep_alive transmise à Ollama (par défaut : 0 ; utiliser '5m' pour comparer froid vs chaud)",
+    )
+    parser.add_argument(
+        "--journal-serveur",
+        default="",
+        help="Journal du serveur Ollama actif (par défaut : %%LOCALAPPDATA%%\\Ollama\\server.log d'Ollama Desktop ; "
+        "avec 'ollama serve', redirigez stderr vers un fichier et passez son chemin)",
     )
     parser.add_argument(
         "--capture-pcap",
@@ -291,7 +462,10 @@ def main() -> None:
     jeton_canari = args.canari.strip() or f"CANARI-CONFIDENTIEL-LOCAL-{uuid.uuid4().hex}"
     horodatage = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
     versions = collecter_versions_et_digest(args.modele)
+    journal = chemin_journal_serveur(args.journal_serveur)
 
+    debut_test = dt.datetime.now().astimezone()
+    taille_journal_avant = taille_journal(journal)
     ecoutes_avant, distantes_avant, err_sock_avant = inspecter_sockets_ollama()
     dns_avant, err_dns_avant = lire_cache_dns_windows()
 
@@ -307,7 +481,7 @@ def main() -> None:
             if str(e.get("LocalAddress")) not in ("127.0.0.1", "::1")
         ]
         if not ecoutes_avant:
-            ctrl_binding = {"etat": "non_concluant", "detail": "aucun socket Listen détecté pour ollama*"}
+            ctrl_binding = {"etat": "non_concluant", "detail": "aucun socket Listen détecté pour ollama* / llama-server"}
         elif exposees:
             ctrl_binding = {"etat": "echec", "detail": f"socket(s) exposé(s) hors loopback : {', '.join(exposees)}"}
         else:
@@ -368,10 +542,12 @@ def main() -> None:
             }
         )
         echo_exact = texte_reponse == jeton_canari
+        mode = "FROID, modèle chargé pendant l'appel" if load_s > SEUIL_CHARGEMENT_FROID_S else "CHAUD, modèle déjà en mémoire"
+        mesures_inf["mode"] = "froid" if load_s > SEUIL_CHARGEMENT_FROID_S else "chaud"
         if echo_exact:
             ctrl_canari = {
                 "etat": "reussi",
-                "detail": f"écho exact en {total_s}s (chargement={load_s}s, {mesures.get('prompt_eval_count')} -> {mesures.get('eval_count')} tok)",
+                "detail": f"écho exact en {total_s}s [{mode}] (chargement={load_s}s, {mesures.get('prompt_eval_count')} -> {mesures.get('eval_count')} tok)",
             }
         else:
             ctrl_canari = {
@@ -396,11 +572,19 @@ def main() -> None:
         ctrl_tcp = {"etat": "non_execute", "detail": "surveillance TCP dédiée à Windows"}
     else:
         toutes_distantes = distantes_avant + distantes_pendant + distantes_apres
+        anterieures, ouvertes_pendant = classer_connexions(toutes_distantes, debut_test)
         erreurs_sock = [e for e in (err_sock_avant, *erreurs_sock_pendant, err_sock_apres) if e]
-        if toutes_distantes:
+        if ouvertes_pendant:
             ctrl_tcp = {
                 "etat": "echec",
-                "detail": f"{len(toutes_distantes)} connexion(s) distante(s) détectée(s) : {toutes_distantes}",
+                "detail": f"{len(ouvertes_pendant)} connexion(s) distante(s) ouverte(s) pendant le test : {'; '.join(ouvertes_pendant)}",
+            }
+        elif anterieures:
+            ctrl_tcp = {
+                "etat": "non_concluant",
+                "detail": f"{len(anterieures)} connexion(s) distante(s) ouverte(s) AVANT le test, non imputables à "
+                f"l'inférence (ex. vérification de mises à jour / recommandations vers ollama.com) : {'; '.join(anterieures)}. "
+                "Relancez l'audit une fois fermées (~2 min après le démarrage d'Ollama) ou activez le pare-feu",
             }
         elif erreurs_sock:
             ctrl_tcp = {
@@ -410,7 +594,7 @@ def main() -> None:
         else:
             ctrl_tcp = {
                 "etat": "reussi",
-                "detail": f"0 connexion TCP distante sur ollama* ({nb_echantillons} échantillon(s) sur {fenetre_s}s)",
+                "detail": f"0 connexion TCP distante sur ollama* + llama-server ({nb_echantillons} échantillon(s) sur {fenetre_s}s)",
             }
 
     # 4. Cache DNS Windows
@@ -432,11 +616,12 @@ def main() -> None:
         else:
             ctrl_dns = {"etat": "echec", "detail": f"entrée(s) DNS suspecte(s) : {', '.join(dns_suspects)}"}
 
-    # 5. Journal server.log
-    ctrl_log, meta_log = verifier_canari_server_log(jeton_canari)
+    # 5. Journal du serveur actif (octets écrits pendant le test uniquement)
+    ctrl_log, meta_log = verifier_canari_journal(jeton_canari, journal, taille_journal_avant)
 
-    # 6. Variables d'environnement de session
-    ctrl_env = verifier_env_durcissement()
+    # 6. Durcissement EFFECTIF du serveur actif (lu dans son journal, pas dans ce shell)
+    config_serveur = lire_config_serveur(journal)
+    ctrl_env = verifier_durcissement_serveur(config_serveur)
 
     # 7. Pare-feu sortant Windows Defender
     ctrl_fw = verifier_pare_feu_windows()
@@ -501,11 +686,15 @@ def main() -> None:
             "fenetre_s": fenetre_s,
             "intervalle_s": INTERVALLE_POLLING_S,
         },
-        "fichiers_inspectes": {"server_log": meta_log},
+        "fichiers_inspectes": {"journal_serveur": meta_log},
+        "config_serveur": config_serveur,
         "limites_capture": [
             f"Le polling Get-NetTCPConnection ({INTERVALLE_POLLING_S}s) peut manquer une connexion TCP très brève ou un flux UDP.",
-            "Get-DnsClientCache ne détecte ni les connexions vers une IP en dur ni DNS-over-HTTPS (DoH).",
-            "variables_durcissement lit l'environnement de la session cliente, pas celui d'un serveur ollama.exe déjà démarré.",
+            "Get-DnsClientCache ne détecte ni les connexions vers une IP en dur ni DNS-over-HTTPS (DoH), "
+            "ni les résolutions déjà en cache avant le test.",
+            "Seuls les processus ollama* et llama-server sont surveillés.",
+            "variables_durcissement lit la configuration écrite par le serveur dans son journal au démarrage ; "
+            "OLLAMA_DEBUG_LOG_REQUESTS rendrait le contrôle du journal caduc.",
             "Seuls le pare-feu OS, une capture PktMon/Wireshark ou Docker network_mode=none couvrent le niveau paquet/noyau.",
         ],
         "controles": controles,

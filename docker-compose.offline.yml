@@ -4,6 +4,10 @@
 #   docker pull ollama/ollama:latest
 #   $env:EP3_OLLAMA_IMAGE = docker image inspect ollama/ollama:latest --format '{{index .RepoDigests 0}}'
 #   $env:EP3_MODELS       = (Resolve-Path -LiteralPath "$env:USERPROFILE\.ollama\models").Path
+#   (Ces deux variables sont exigées par TOUTE commande compose sur ce fichier, `down` compris ;
+#    à défaut : `docker rm -f ollama-airgap`.)
+#   Le digest testé (sha256:d00473cb…c661) embarque Ollama 0.23.2 (CPU) : ses temps ne sont pas
+#   comparables tels quels à Ollama 0.40.x natif sur GPU.
 #
 # 1. Profil `airgap` (RECOMMANDÉ pour l'isolation complète : `network_mode: none`, aucun port publié,
 #    modèles seuls montés sur `/models` en lecture seule, `no-new-privileges:true`) :

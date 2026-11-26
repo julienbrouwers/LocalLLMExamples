@@ -9,9 +9,14 @@
     - `-Action EnvUtilisateur` sauvegarde les valeurs précédentes du profil utilisateur Windows
       dans `$env:TEMP\ollama-ep3-env-backup.json` avant modification ; `-Action Reinitialiser`
       restaure ces valeurs exactes (ou supprime les variables si elles n'existaient pas).
-    - `-Action Bloquer` bloque les chemins exacts des processus `ollama` et `ollama app`
-      (`Ollama-Block-Outbound-LocalOnly` et `Ollama-Block-Outbound-App-LocalOnly`).
-    - `-Action Debloquer` supprime UNIQUEMENT les deux règles créées par ce script.
+    - Les variables d'environnement ne coupent PAS la vérification des mises à jour d'Ollama Desktop
+      (`ollama app.exe`, toutes les heures) : aucune variable `OLLAMA_*` ne le permet. Utilisez le réglage
+      de mise à jour automatique de l'application, `ollama serve` sans l'application, ou `-Action Bloquer`.
+    - `-Action Bloquer` bloque les chemins exacts des trois binaires réseau-capables d'Ollama :
+      `ollama.exe` (`Ollama-Block-Outbound-LocalOnly`), `ollama app.exe` (`Ollama-Block-Outbound-App-LocalOnly`)
+      et le moteur d'inférence `lib\ollama\llama-server.exe` (`Ollama-Block-Outbound-LlamaServer`),
+      qui charge les poids et traite les prompts depuis Ollama 0.40.x.
+    - `-Action Debloquer` supprime UNIQUEMENT les trois règles créées par ce script.
 
 .EXAMPLE
     .\securiser-ollama-windows.ps1 -Action Statut
@@ -33,6 +38,8 @@ param(
 
 $NomRegleCli = "Ollama-Block-Outbound-LocalOnly"
 $NomRegleApp = "Ollama-Block-Outbound-App-LocalOnly"
+$NomRegleRunner = "Ollama-Block-Outbound-LlamaServer"
+$NomsRegles = @($NomRegleCli, $NomRegleApp, $NomRegleRunner)
 $FichierSauvegardeEnv = Join-Path $env:TEMP "ollama-ep3-env-backup.json"
 
 $VariablesDurcissement = [ordered]@{
@@ -64,8 +71,20 @@ function Resolve-CheminsOllama {
         $candidatApp = Join-Path (Split-Path -Parent $chemins["cli"]) "ollama app.exe"
         if (Test-Path -LiteralPath $candidatApp) { $chemins["app"] = $candidatApp }
     }
+
+    # Moteur d'inférence (Ollama 0.40.x) : lib\ollama\llama-server.exe à côté de ollama.exe
+    $procRunner = Get-Process -Name "llama-server" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -like "*\lib\ollama\llama-server.exe" } |
+        Select-Object -First 1 -ExpandProperty Path
+    if ($procRunner) { $chemins["runner"] = $procRunner }
+    else {
+        $candidatRunner = Join-Path (Split-Path -Parent $chemins["cli"]) "lib\ollama\llama-server.exe"
+        if (Test-Path -LiteralPath $candidatRunner) { $chemins["runner"] = $candidatRunner }
+    }
     return $chemins
 }
+
+$NoteMisesAJour = "NOTE : ces variables ne coupent PAS la vérification des mises à jour d'Ollama Desktop (ollama app.exe contacte ollama.com au démarrage puis toutes les heures). Désactivez la mise à jour automatique dans l'application, utilisez 'ollama serve' sans l'application, ou '-Action Bloquer' (admin)."
 
 $Chemins = Resolve-CheminsOllama
 
@@ -76,7 +95,11 @@ switch ($Action) {
         }
         Write-Output "Variables de durcissement appliquées pour cette session PowerShell :"
         Get-ChildItem Env:OLLAMA* | Format-Table Name, Value -AutoSize
-        Write-Output "RAPPEL : Ollama ne lit ces variables qu'au démarrage du serveur. Quittez Ollama Desktop puis lancez 'ollama serve' dans cette session (ou utilisez -Action EnvUtilisateur puis redémarrez Ollama)."
+        Write-Output "RAPPEL : Ollama ne lit ces variables qu'au démarrage du serveur. Quittez Ollama Desktop puis lancez le serveur depuis cette session (ou utilisez -Action EnvUtilisateur puis redémarrez Ollama)."
+        Write-Output "Pour que verifier_isolation_ollama.py puisse lire le journal de ce serveur :"
+        Write-Output "  Start-Process ollama -ArgumentList serve -NoNewWindow -RedirectStandardError .\ollama-serve.log"
+        Write-Output "  python -X utf8 .\fonctions\verifier_isolation_ollama.py --journal-serveur .\ollama-serve.log"
+        Write-Output $NoteMisesAJour
     }
 
     "EnvUtilisateur" {
@@ -95,6 +118,7 @@ switch ($Action) {
         Write-Output "Variables de durcissement enregistrées pour l'utilisateur Windows courant :"
         Get-ChildItem Env:OLLAMA* | Format-Table Name, Value -AutoSize
         Write-Output "Redémarrez maintenant Ollama pour que le serveur prenne en compte ces variables."
+        Write-Output $NoteMisesAJour
     }
 
     "Reinitialiser" {
@@ -122,7 +146,7 @@ switch ($Action) {
             Write-Output "Aucune sauvegarde EnvUtilisateur trouvée : les variables persistantes du profil utilisateur Windows ont été préservées telles quelles."
         }
 
-        $regles = Get-NetFirewallRule -Name $NomRegleCli, $NomRegleApp -ErrorAction SilentlyContinue
+        $regles = Get-NetFirewallRule -Name $NomsRegles -ErrorAction SilentlyContinue
         if ($regles) {
             Write-Warning "Des règles pare-feu créées par ce script sont encore actives : lancez '.\securiser-ollama-windows.ps1 -Action Debloquer' en PowerShell Administrateur."
         }
@@ -153,9 +177,21 @@ switch ($Action) {
                 -Description "Bloque tout trafic sortant d'ollama app.exe (Épisode 3)." -ErrorAction Stop | Out-Null
             $reglesCreees += $NomRegleApp
         } else {
-            Write-Warning "ollama app.exe introuvable : seule la règle sur ollama.exe a été créée."
+            Write-Warning "ollama app.exe introuvable : pas de règle pour l'application Desktop."
         }
 
+        if ($Chemins["runner"] -and (Test-Path -LiteralPath $Chemins["runner"])) {
+            Remove-NetFirewallRule -Name $NomRegleRunner -ErrorAction SilentlyContinue
+            New-NetFirewallRule -Name $NomRegleRunner -DisplayName $NomRegleRunner `
+                -Direction Outbound -Program $Chemins["runner"] -Action Block -Profile Any `
+                -Description "Bloque tout trafic sortant du moteur d'inférence llama-server.exe d'Ollama (Épisode 3)." -ErrorAction Stop | Out-Null
+            $reglesCreees += $NomRegleRunner
+        } else {
+            Write-Warning "lib\ollama\llama-server.exe introuvable (version d'Ollama sans moteur séparé ?) : pas de règle pour le moteur d'inférence."
+        }
+
+        Write-Output "=== Binaires bloqués ==="
+        foreach ($cle in @("cli", "app", "runner")) { if ($Chemins[$cle]) { Write-Output "  $cle : $($Chemins[$cle])" } }
         Write-Output "=== Profil réseau actif ==="
         Get-NetConnectionProfile | Select-Object Name, NetworkCategory | Format-Table -AutoSize
         Write-Output "=== Profils pare-feu actifs ==="
@@ -171,7 +207,7 @@ switch ($Action) {
             exit 1
         }
         $supprimees = @()
-        foreach ($nom in @($NomRegleCli, $NomRegleApp)) {
+        foreach ($nom in $NomsRegles) {
             if (Get-NetFirewallRule -Name $nom -ErrorAction SilentlyContinue) {
                 Remove-NetFirewallRule -Name $nom -ErrorAction Stop
                 $supprimees += $nom
@@ -188,6 +224,7 @@ switch ($Action) {
         Write-Output "=== Binaires Ollama détectés ==="
         Write-Output "CLI/Serveur : $($Chemins['cli'])"
         if ($Chemins["app"]) { Write-Output "Desktop App : $($Chemins['app'])" }
+        if ($Chemins["runner"]) { Write-Output "Moteur d'inférence : $($Chemins['runner'])" }
         Write-Output "`n=== Variables session Env:OLLAMA* ==="
         $vars = Get-ChildItem Env:OLLAMA* -ErrorAction SilentlyContinue
         if ($vars) { $vars | Format-Table Name, Value -AutoSize } else { Write-Output "(aucune variable OLLAMA_* définie dans cette session)" }
@@ -201,8 +238,12 @@ switch ($Action) {
             Write-Warning "OLLAMA_ORIGINS contient '*' : toute page web ouverte dans le navigateur peut interroger http://127.0.0.1:11434 !"
         }
         Write-Output "=== Règles pare-feu créées par ce script ==="
-        $regles = Get-NetFirewallRule -Name $NomRegleCli, $NomRegleApp -ErrorAction SilentlyContinue
-        if ($regles) { $regles | Select-Object Name, Direction, Action, Enabled, Profile | Format-Table -AutoSize }
-        else { Write-Output "(non installées : ollama.exe et ollama app.exe peuvent sortir sur Internet)" }
+        $regles = @(Get-NetFirewallRule -Name $NomsRegles -ErrorAction SilentlyContinue)
+        if ($regles) {
+            $regles | Select-Object Name, Direction, Action, Enabled, Profile | Format-Table -AutoSize
+            $absentes = $NomsRegles | Where-Object { $_ -notin $regles.Name }
+            if ($absentes) { Write-Warning "Règle(s) manquante(s) : $($absentes -join ', ') (relancez -Action Bloquer)." }
+        }
+        else { Write-Output "(non installées : ollama.exe, ollama app.exe et llama-server.exe peuvent sortir sur Internet)" }
     }
 }
