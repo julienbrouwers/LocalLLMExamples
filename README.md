@@ -71,7 +71,7 @@ ollama serve
 # Option B: persist to Windows User env (saves exact previous values to %TEMP%\ollama-ep3-env-backup.json), then restart Ollama
 .\securiser-ollama-windows.ps1 -Action EnvUtilisateur
 
-# Rollback (restores exact previous User env values or deletes if previously absent, then restart Ollama)
+# Rollback (restores exact previous User env values from backup; if no backup exists, clears session vars only and preserves pre-existing User vars)
 . .\securiser-ollama-windows.ps1 -Action Reinitialiser
 ```
 
@@ -105,10 +105,13 @@ python -X utf8 .\fonctions\verifier_isolation_ollama.py --modele qwen2.5:3b --st
 Pin the exact image digest and bind-mount **only** your local models directory read-only to `/models` (no port published):
 
 ```powershell
-# 1. Pull image once, pin its exact repo digest, and resolve the host models directory
-docker pull ollama/ollama:latest
-$env:EP3_OLLAMA_IMAGE = docker image inspect ollama/ollama:latest --format '{{index .RepoDigests 0}}'
+# 1. Pull the exact tested digest directly and resolve the host models directory
+$env:EP3_OLLAMA_IMAGE = 'ollama/ollama@sha256:d00473cb58f0082c07cd6ed0d326a8a86f443ab69c51f8fc2b1a41687d45c661'
+docker pull $env:EP3_OLLAMA_IMAGE
 $env:EP3_MODELS       = (Resolve-Path -LiteralPath "$env:USERPROFILE\.ollama\models").Path
+
+# (Optional: to pin a newer image instead, run `docker pull ollama/ollama:latest`
+#  and `$env:EP3_OLLAMA_IMAGE = docker image inspect ollama/ollama:latest --format '{{index .RepoDigests 0}}'`)
 
 # 2. Validate effective Compose config and start offline (--pull never)
 $compose = @('-p', 'ollama-ep3', '-f', '.\docker-compose.offline.yml', '--profile', 'airgap')

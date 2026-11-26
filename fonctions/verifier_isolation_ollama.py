@@ -39,15 +39,21 @@ REGLES_PARE_FEU_SCRIPT = (
 INTERVALLE_POLLING_S = 0.35
 
 
-def _executer_powershell(commande: str) -> str:
-    """Exécute une commande PowerShell en lecture seule et renvoie stdout."""
-    res = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", commande],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    return res.stdout.strip()
+def _executer_powershell(commande: str) -> tuple[bool, str, str]:
+    """Exécute une commande PowerShell en lecture seule et renvoie `(ok, stdout, erreur)`."""
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", commande],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", f"erreur d'exécution PowerShell : {exc}"
+    if res.returncode != 0:
+        err = res.stderr.strip() or f"code de sortie PowerShell {res.returncode}"
+        return False, res.stdout.strip(), err
+    return True, res.stdout.strip(), ""
 
 
 def _lire_json_api(endpoint: str, timeout: int = 10) -> dict[str, Any]:
@@ -89,10 +95,10 @@ def lire_ollama_ps(modele: str) -> dict[str, Any]:
     return {"brut": lignes, "ligne_modele": ligne_modele}
 
 
-def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Retourne `(ecoutes, connexions_distantes)` pour les processus `ollama*`."""
+def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    """Retourne `(ecoutes, connexions_distantes, erreur)` pour les processus `ollama*`."""
     if platform.system() != "Windows":
-        return [], []
+        return [], [], None
 
     ps = (
         "$p = (Get-Process -Name 'ollama*' -ErrorAction SilentlyContinue).Id; "
@@ -101,13 +107,15 @@ def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any
         "Select-Object OwningProcess, State, LocalAddress, LocalPort, RemoteAddress, RemotePort); "
         "$c | ConvertTo-Json -Compress"
     )
-    sortie = _executer_powershell(ps)
+    ok, sortie, err = _executer_powershell(ps)
+    if not ok:
+        return [], [], f"collecte sockets impossible : {err}"
     if not sortie:
-        return [], []
+        return [], [], None
     try:
         donnees = json.loads(sortie)
-    except ValueError:
-        return [], []
+    except ValueError as exc:
+        return [], [], f"parsing JSON sockets impossible : {exc}"
     if isinstance(donnees, dict):
         donnees = [donnees]
 
@@ -120,34 +128,43 @@ def inspecter_sockets_ollama() -> tuple[list[dict[str, Any]], list[dict[str, Any
             ecoutes.append(item)
         elif remote not in ADRESSE_LOOPBACK:
             distantes.append(item)
-    return ecoutes, distantes
+    return ecoutes, distantes, None
 
 
 def verifier_pare_feu_windows() -> dict[str, Any]:
-    """Vérifie si les règles pare-feu sortantes bloquantes du script sont actives sur Windows."""
+    """Exige les DEUX règles sortantes bloquantes effectives dans ActiveStore pour PASS."""
     if platform.system() != "Windows":
         return {"etat": "non_execute", "detail": "vérification pare-feu automatique dédiée à Windows"}
 
     noms_ps = ", ".join(f"'{n}'" for n in REGLES_PARE_FEU_SCRIPT)
     ps = (
-        f"$r = @(Get-NetFirewallRule -Name {noms_ps} -ErrorAction SilentlyContinue | "
+        f"$r = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name {noms_ps} -ErrorAction SilentlyContinue | "
         "Where-Object { $_.Direction -eq 'Outbound' -and $_.Action -eq 'Block' -and $_.Enabled -eq 'True' } | "
         "Select-Object -ExpandProperty Name); "
         "$r | ConvertTo-Json -Compress"
     )
-    sortie = _executer_powershell(ps)
+    ok, sortie, err = _executer_powershell(ps)
+    if not ok:
+        return {"etat": "non_concluant", "detail": f"collecte pare-feu ActiveStore impossible : {err}"}
     if not sortie:
         regles: list[str] = []
     else:
         try:
             brut = json.loads(sortie)
             regles = [brut] if isinstance(brut, str) else list(brut)
-        except ValueError:
-            regles = []
+        except ValueError as exc:
+            return {"etat": "non_concluant", "detail": f"parsing JSON pare-feu impossible : {exc}"}
 
-    if regles:
-        return {"etat": "reussi", "detail": f"règle(s) bloquante(s) active(s) : {', '.join(regles)}"}
-    return {"etat": "echec", "detail": "aucune règle sortante Block créée par ce script n'est active"}
+    actives = set(regles)
+    manquantes = [r for r in REGLES_PARE_FEU_SCRIPT if r not in actives]
+    if not manquantes:
+        return {"etat": "reussi", "detail": f"2/2 règles effectives actives (ActiveStore) : {', '.join(REGLES_PARE_FEU_SCRIPT)}"}
+    if actives:
+        return {
+            "etat": "echec",
+            "detail": f"règles incomplètes ({len(actives)}/2 actives) : manquante(s) = {', '.join(manquantes)}",
+        }
+    return {"etat": "echec", "detail": "0/2 règles sortantes Block actives dans ActiveStore"}
 
 
 def verifier_env_durcissement() -> dict[str, Any]:
@@ -190,24 +207,26 @@ def verifier_env_durcissement() -> dict[str, Any]:
     }
 
 
-def lire_cache_dns_windows() -> set[str]:
-    """Retourne les noms de domaines présents dans le cache DNS Windows."""
+def lire_cache_dns_windows() -> tuple[set[str], str | None]:
+    """Retourne `(entrees, erreur)` pour les noms de domaines présents dans le cache DNS Windows."""
     if platform.system() != "Windows":
-        return set()
+        return set(), None
     ps = (
-        "@(Get-DnsClientCache -ErrorAction SilentlyContinue | "
+        "@(Get-DnsClientCache -ErrorAction Stop | "
         "Select-Object -ExpandProperty Entry -Unique) | ConvertTo-Json -Compress"
     )
-    sortie = _executer_powershell(ps)
+    ok, sortie, err = _executer_powershell(ps)
+    if not ok:
+        return set(), f"collecte cache DNS impossible : {err}"
     if not sortie:
-        return set()
+        return set(), None
     try:
         brut = json.loads(sortie)
         if isinstance(brut, str):
-            return {brut.lower()}
-        return {str(x).lower() for x in brut}
-    except ValueError:
-        return set()
+            return {brut.lower()}, None
+        return {str(x).lower() for x in brut}, None
+    except ValueError as exc:
+        return set(), f"parsing JSON cache DNS impossible : {exc}"
 
 
 def verifier_canari_server_log(jeton: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -273,12 +292,14 @@ def main() -> None:
     horodatage = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
     versions = collecter_versions_et_digest(args.modele)
 
-    ecoutes_avant, distantes_avant = inspecter_sockets_ollama()
-    dns_avant = lire_cache_dns_windows()
+    ecoutes_avant, distantes_avant, err_sock_avant = inspecter_sockets_ollama()
+    dns_avant, err_dns_avant = lire_cache_dns_windows()
 
     # 1. Binding strict loopback
     if not est_windows:
         ctrl_binding = {"etat": "non_execute", "detail": "inspection Get-NetTCPConnection dédiée à Windows"}
+    elif err_sock_avant:
+        ctrl_binding = {"etat": "non_concluant", "detail": err_sock_avant}
     else:
         exposees = [
             f"{e.get('LocalAddress')}:{e.get('LocalPort')}"
@@ -295,14 +316,17 @@ def main() -> None:
 
     # 2. Inférence locale sur le marqueur canari + surveillance TCP continue
     distantes_pendant: list[dict[str, Any]] = []
+    erreurs_sock_pendant: list[str] = []
     nb_echantillons = 0
     stop_event = threading.Event()
 
     def _surveiller_sockets() -> None:
         nonlocal nb_echantillons
         while not stop_event.is_set():
-            _, dist = inspecter_sockets_ollama()
+            _, dist, err_s = inspecter_sockets_ollama()
             nb_echantillons += 1
+            if err_s:
+                erreurs_sock_pendant.append(err_s)
             if dist:
                 distantes_pendant.extend(dist)
             stop_event.wait(INTERVALLE_POLLING_S)
@@ -364,28 +388,39 @@ def main() -> None:
     fenetre_s = round(time.monotonic() - t0, 2)
 
     ollama_ps = lire_ollama_ps(args.modele)
-    _, distantes_apres = inspecter_sockets_ollama()
-    dns_apres = lire_cache_dns_windows()
+    _, distantes_apres, err_sock_apres = inspecter_sockets_ollama()
+    dns_apres, err_dns_apres = lire_cache_dns_windows()
 
     # 3. Connexions TCP distantes observées
     if not est_windows:
         ctrl_tcp = {"etat": "non_execute", "detail": "surveillance TCP dédiée à Windows"}
     else:
         toutes_distantes = distantes_avant + distantes_pendant + distantes_apres
-        if not toutes_distantes:
-            ctrl_tcp = {
-                "etat": "reussi",
-                "detail": f"0 connexion TCP distante sur ollama* ({nb_echantillons} échantillon(s) sur {fenetre_s}s)",
-            }
-        else:
+        erreurs_sock = [e for e in (err_sock_avant, *erreurs_sock_pendant, err_sock_apres) if e]
+        if toutes_distantes:
             ctrl_tcp = {
                 "etat": "echec",
                 "detail": f"{len(toutes_distantes)} connexion(s) distante(s) détectée(s) : {toutes_distantes}",
+            }
+        elif erreurs_sock:
+            ctrl_tcp = {
+                "etat": "non_concluant",
+                "detail": f"erreur(s) de collecte sockets ({len(erreurs_sock)}) : {erreurs_sock[0]}",
+            }
+        else:
+            ctrl_tcp = {
+                "etat": "reussi",
+                "detail": f"0 connexion TCP distante sur ollama* ({nb_echantillons} échantillon(s) sur {fenetre_s}s)",
             }
 
     # 4. Cache DNS Windows
     if not est_windows:
         ctrl_dns = {"etat": "non_execute", "detail": "cache DNS dédié à Windows"}
+    elif err_dns_avant or err_dns_apres:
+        ctrl_dns = {
+            "etat": "non_concluant",
+            "detail": err_dns_avant or err_dns_apres or "erreur de collecte cache DNS",
+        }
     else:
         nouveaux_dns = sorted(dns_apres - dns_avant)
         dns_suspects = [d for d in nouveaux_dns if "ollama" in d or jeton_canari.lower() in d]

@@ -117,11 +117,9 @@ switch ($Action) {
         } else {
             foreach ($cle in $VariablesDurcissement.Keys) {
                 Remove-Item -Path "Env:$cle" -ErrorAction SilentlyContinue
-                if ($null -ne [Environment]::GetEnvironmentVariable($cle, "User")) {
-                    [Environment]::SetEnvironmentVariable($cle, $null, "User")
-                }
             }
-            Write-Output "Variables OLLAMA_* supprimées de la session courante et du profil utilisateur Windows (aucune sauvegarde antérieure présente)."
+            Write-Output "Variables OLLAMA_* supprimées de la session courante uniquement."
+            Write-Output "Aucune sauvegarde EnvUtilisateur trouvée : les variables persistantes du profil utilisateur Windows ont été préservées telles quelles."
         }
 
         $regles = Get-NetFirewallRule -Name $NomRegleCli, $NomRegleApp -ErrorAction SilentlyContinue
