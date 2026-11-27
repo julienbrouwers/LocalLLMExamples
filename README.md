@@ -158,6 +158,16 @@ docker compose @compose down
 
 **Optional `loopback` profile (separate behavior):** `docker-compose.offline.yml` also includes `--profile loopback`, which publishes `127.0.0.1:11435:11434` (restricting **inbound** LAN access only) while keeping Docker's default bridge **outbound** Internet access. Only `--profile airgap` (`network_mode: none`) cuts outbound traffic at the kernel level.
 
+### Replay the whole article automatically
+
+`rejouer-article.ps1` replays every verifiable claim of the Episode 3 article (baseline, Tier 1 options A and B, `OLLAMA_ORIGINS`, `OLLAMA_NO_CLOUD`, zero-trace pipe, Docker airgap and hardened variant), marks each one `OK` / `ECART` / `NON_EXECUTE`, writes a Markdown report (`rejeu-article-*.md`, git-ignored) and restores the initial state (Ollama processes, User `OLLAMA_*` variables, firewall rules, containers). It takes 8 to 12 minutes; do not use Ollama or Docker meanwhile.
+
+```powershell
+.\rejouer-article.ps1                  # no admin: everything except Tier 2
+.\rejouer-article.ps1 -Admin           # + Tier 2 firewall in an elevated session (accept the UAC prompt)
+.\rejouer-article.ps1 -CloneNeuf       # replay from a fresh clone of the branch
+```
+
 ### Step 5 — Disk & Log Hygiene Audit + Zero-Trace Usage
 
 ```powershell

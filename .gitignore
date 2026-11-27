@@ -12,3 +12,5 @@ ollama-serve*.log
 ollama-serve*.out
 *.etl
 *.pcapng
+# Rapports produits par rejouer-article.ps1
+rejeu-article-*.md
