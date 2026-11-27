@@ -594,7 +594,8 @@ def main() -> None:
         else:
             ctrl_tcp = {
                 "etat": "reussi",
-                "detail": f"0 connexion TCP distante sur ollama* + llama-server ({nb_echantillons} échantillon(s) sur {fenetre_s}s)",
+                "detail": f"0 connexion TCP distante sur ollama* + llama-server ({nb_echantillons} échantillon(s) sur {fenetre_s}s, "
+                f"soit ~{round(fenetre_s / nb_echantillons, 1) if nb_echantillons else '?'}s entre deux relevés)",
             }
 
     # 4. Cache DNS Windows
@@ -689,7 +690,9 @@ def main() -> None:
         "fichiers_inspectes": {"journal_serveur": meta_log},
         "config_serveur": config_serveur,
         "limites_capture": [
-            f"Le polling Get-NetTCPConnection ({INTERVALLE_POLLING_S}s) peut manquer une connexion TCP très brève ou un flux UDP.",
+            f"Le polling Get-NetTCPConnection (pause {INTERVALLE_POLLING_S}s + lancement PowerShell, intervalle effectif "
+            f"{round(fenetre_s / nb_echantillons, 2) if nb_echantillons else '?'}s sur ce test) peut manquer une connexion TCP "
+            "très brève ; il ne voit pas l'UDP (DNS/UDP, QUIC).",
             "Get-DnsClientCache ne détecte ni les connexions vers une IP en dur ni DNS-over-HTTPS (DoH), "
             "ni les résolutions déjà en cache avant le test.",
             "Seuls les processus ollama* et llama-server sont surveillés.",
